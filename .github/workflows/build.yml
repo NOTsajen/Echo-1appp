@@ -142,16 +142,335 @@ jobs:
               }
           }
           EOF
+          cat > native/AssistPlugin.java <<'EOF'
+          package com.echo1.app;
+
+          import android.content.Intent;
+          import android.provider.Settings;
+          import com.getcapacitor.JSObject;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+
+          /** Hands what you said or typed in the assistant bubble over to the ECHO-1 web app, and helps set ECHO-1 as the phone's assistant. */
+          @CapacitorPlugin(name = "Assist")
+          public class AssistPlugin extends Plugin {
+              static volatile String pending = "";
+
+              @PluginMethod
+              public void takeQuery(PluginCall call) {
+                  JSObject r = new JSObject();
+                  r.put("text", pending == null ? "" : pending);
+                  pending = "";
+                  call.resolve(r);
+              }
+
+              @PluginMethod
+              public void isDefault(PluginCall call) {
+                  boolean yes = false;
+                  try {
+                      String s = Settings.Secure.getString(getContext().getContentResolver(), "assistant");
+                      yes = s != null && s.contains(getContext().getPackageName());
+                  } catch (Exception ignored) { }
+                  JSObject r = new JSObject();
+                  r.put("value", yes);
+                  call.resolve(r);
+              }
+
+              @PluginMethod
+              public void openSettings(PluginCall call) {
+                  String[] actions = { Settings.ACTION_VOICE_INPUT_SETTINGS, Settings.ACTION_MANAGE_DEFAULT_APPS_SETTINGS, Settings.ACTION_SETTINGS };
+                  for (String a : actions) {
+                      try {
+                          getContext().startActivity(new Intent(a).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+                          call.resolve();
+                          return;
+                      } catch (Exception ignored) { }
+                  }
+                  call.reject("Could not open settings");
+              }
+          }
+          EOF
+          cat > native/AssistActivity.java <<'EOF'
+          package com.echo1.app;
+
+          import android.Manifest;
+          import android.app.Activity;
+          import android.content.ComponentName;
+          import android.content.Intent;
+          import android.content.pm.PackageManager;
+          import android.graphics.Color;
+          import android.graphics.Typeface;
+          import android.graphics.drawable.GradientDrawable;
+          import android.os.Bundle;
+          import android.speech.RecognitionListener;
+          import android.speech.RecognizerIntent;
+          import android.speech.SpeechRecognizer;
+          import android.view.Gravity;
+          import android.view.ViewGroup;
+          import android.view.WindowManager;
+          import android.view.inputmethod.EditorInfo;
+          import android.widget.EditText;
+          import android.widget.FrameLayout;
+          import android.widget.LinearLayout;
+          import android.widget.TextView;
+          import java.util.ArrayList;
+
+          /** The ECHO-1 bubble: speak or type, then ECHO-1 opens and answers. */
+          public class AssistActivity extends Activity implements RecognitionListener {
+              private SpeechRecognizer rec;
+              private EditText input;
+              private TextView status, mic;
+              private boolean listening = false, triedDefault = false;
+
+              private int dp(int v) { return Math.round(v * getResources().getDisplayMetrics().density); }
+
+              private TextView circle(String label, int color) {
+                  TextView t = new TextView(this);
+                  t.setText(label);
+                  t.setTextSize(20);
+                  t.setGravity(Gravity.CENTER);
+                  t.setTextColor(Color.WHITE);
+                  GradientDrawable g = new GradientDrawable();
+                  g.setShape(GradientDrawable.OVAL);
+                  g.setColor(color);
+                  t.setBackground(g);
+                  LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(dp(48), dp(48));
+                  lp.leftMargin = dp(8);
+                  t.setLayoutParams(lp);
+                  return t;
+              }
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
+
+                  FrameLayout root = new FrameLayout(this);
+                  root.setBackgroundColor(0x88000000);
+                  root.setOnClickListener(v -> finish());
+
+                  LinearLayout card = new LinearLayout(this);
+                  card.setOrientation(LinearLayout.VERTICAL);
+                  card.setPadding(dp(20), dp(18), dp(20), dp(22));
+                  GradientDrawable bg = new GradientDrawable();
+                  bg.setColor(0xFF1A1633);
+                  float r = dp(28);
+                  bg.setCornerRadii(new float[] { r, r, r, r, 0, 0, 0, 0 });
+                  card.setBackground(bg);
+                  card.setClickable(true);
+                  root.addView(card, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM));
+
+                  TextView title = new TextView(this);
+                  title.setText("ECHO-1");
+                  title.setTextColor(0xFF8FA81F);
+                  title.setTextSize(14);
+                  title.setTypeface(Typeface.DEFAULT_BOLD);
+                  card.addView(title);
+
+                  status = new TextView(this);
+                  status.setText("Listening…");
+                  status.setTextColor(0xFFF4F1FF);
+                  status.setTextSize(18);
+                  status.setPadding(0, dp(8), 0, dp(12));
+                  card.addView(status);
+
+                  LinearLayout row = new LinearLayout(this);
+                  row.setOrientation(LinearLayout.HORIZONTAL);
+                  row.setGravity(Gravity.CENTER_VERTICAL);
+                  card.addView(row);
+
+                  input = new EditText(this);
+                  input.setHint("Type or tap the mic");
+                  input.setHintTextColor(0x88F4F1FF);
+                  input.setTextColor(0xFFF4F1FF);
+                  input.setSingleLine(true);
+                  input.setImeOptions(EditorInfo.IME_ACTION_SEND);
+                  input.setOnEditorActionListener((v, a, e) -> { submit(); return true; });
+                  row.addView(input, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+                  mic = circle("🎤", 0xFF4B3FA0);
+                  mic.setOnClickListener(v -> { if (listening) stopListening(); else startListening(); });
+                  row.addView(mic);
+
+                  TextView send = circle("➤", 0xFF8FA81F);
+                  send.setOnClickListener(v -> submit());
+                  row.addView(send);
+
+                  setContentView(root);
+                  root.post(this::startListening);
+              }
+
+              private void startListening() {
+                  if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                      requestPermissions(new String[] { Manifest.permission.RECORD_AUDIO }, 7);
+                      return;
+                  }
+                  try {
+                      if (rec == null) makeRecognizer(false);
+                      Intent i = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+                          .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                          .putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
+                      listening = true;
+                      status.setText("Listening…");
+                      mic.setText("■");
+                      rec.startListening(i);
+                  } catch (Exception e) {
+                      listening = false;
+                      mic.setText("🎤");
+                      status.setText("Voice isn't available. Type instead.");
+                  }
+              }
+
+              private void makeRecognizer(boolean useDefault) {
+                  if (rec != null) { rec.destroy(); rec = null; }
+                  if (!useDefault) {
+                      try {
+                          // If ECHO-1 is the assistant, Android's default speech engine can point back at ECHO-1. Ask Google's directly.
+                          rec = SpeechRecognizer.createSpeechRecognizer(this,
+                              new ComponentName("com.google.android.googlequicksearchbox", "com.google.android.voicesearch.serviceapi.GoogleRecognitionService"));
+                      } catch (Exception ignored) { rec = null; }
+                  }
+                  if (rec == null) rec = SpeechRecognizer.createSpeechRecognizer(this);
+                  rec.setRecognitionListener(this);
+              }
+
+              private void stopListening() {
+                  listening = false;
+                  mic.setText("🎤");
+                  try { if (rec != null) rec.stopListening(); } catch (Exception ignored) { }
+              }
+
+              private void submit() {
+                  String q = input.getText().toString().trim();
+                  if (q.isEmpty()) { status.setText("Say or type something first."); return; }
+                  Intent i = new Intent(this, MainActivity.class)
+                      .putExtra("echo_query", q)
+                      .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+                  startActivity(i);
+                  finish();
+              }
+
+              @Override public void onRequestPermissionsResult(int code, String[] perms, int[] results) {
+                  super.onRequestPermissionsResult(code, perms, results);
+                  if (results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED) startListening();
+                  else status.setText("Mic permission is off. Type instead, or allow it in Settings.");
+              }
+
+              @Override public void onResults(Bundle results) {
+                  listening = false;
+                  mic.setText("🎤");
+                  ArrayList<String> list = results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
+                  if (list != null && !list.isEmpty()) { input.setText(list.get(0)); submit(); }
+                  else status.setText("Didn't catch that. Tap the mic to try again.");
+              }
+
+              @Override public void onPartialResults(Bundle partial) {
+                  ArrayList<String> list = partial.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
+                  if (list != null && !list.isEmpty()) { input.setText(list.get(0)); input.setSelection(input.getText().length()); }
+              }
+
+              @Override public void onError(int error) {
+                  listening = false;
+                  mic.setText("🎤");
+                  if ((error == SpeechRecognizer.ERROR_CLIENT || error == 11) && !triedDefault) {   // Google's engine not reachable: try the phone's default once
+                      triedDefault = true;
+                      try { makeRecognizer(true); startListening(); return; } catch (Exception ignored) { }
+                  }
+                  if (error == SpeechRecognizer.ERROR_NO_MATCH || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT) status.setText("Didn't catch that. Tap the mic to try again.");
+                  else if (error == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) status.setText("Mic permission is off. Type instead.");
+                  else status.setText("Voice problem (code " + error + "). Type instead.");
+              }
+
+              @Override public void onReadyForSpeech(Bundle p) { }
+              @Override public void onBeginningOfSpeech() { }
+              @Override public void onRmsChanged(float rms) { }
+              @Override public void onBufferReceived(byte[] buf) { }
+              @Override public void onEndOfSpeech() { }
+              @Override public void onEvent(int type, Bundle p) { }
+
+              @Override protected void onDestroy() {
+                  super.onDestroy();
+                  try { if (rec != null) rec.destroy(); } catch (Exception ignored) { }
+              }
+          }
+          EOF
+          cat > native/EchoAssistService.java <<'EOF'
+          package com.echo1.app;
+
+          import android.service.voice.VoiceInteractionService;
+
+          /** Makes ECHO-1 show up under Settings > Default apps > Digital assistant app. */
+          public class EchoAssistService extends VoiceInteractionService { }
+          EOF
+          cat > native/EchoSessionService.java <<'EOF'
+          package com.echo1.app;
+
+          import android.os.Bundle;
+          import android.service.voice.VoiceInteractionSession;
+          import android.service.voice.VoiceInteractionSessionService;
+
+          public class EchoSessionService extends VoiceInteractionSessionService {
+              @Override
+              public VoiceInteractionSession onNewSession(Bundle args) {
+                  return new EchoSession(this);
+              }
+          }
+          EOF
+          cat > native/EchoSession.java <<'EOF'
+          package com.echo1.app;
+
+          import android.content.Context;
+          import android.content.Intent;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.service.voice.VoiceInteractionSession;
+
+          /** Runs when you hold Home (or the power button). Opens the ECHO-1 bubble. */
+          public class EchoSession extends VoiceInteractionSession {
+              public EchoSession(Context context) { super(context); }
+
+              @Override
+              public void onShow(Bundle args, int showFlags) {
+                  super.onShow(args, showFlags);
+                  Intent i = new Intent(getContext(), AssistActivity.class)
+                      .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+                  try { startAssistantActivity(i); }
+                  catch (Exception e) { try { getContext().startActivity(i); } catch (Exception ignored) { } }
+                  new Handler(Looper.getMainLooper()).postDelayed(this::hide, 400);
+              }
+          }
+          EOF
+          cat > native/EchoRecognitionService.java <<'EOF'
+          package com.echo1.app;
+
+          import android.content.Intent;
+          import android.speech.RecognitionService;
+          import android.speech.SpeechRecognizer;
+
+          /** Android wants every assistant to declare a recognition service. The bubble uses Google's speech engine instead. */
+          public class EchoRecognitionService extends RecognitionService {
+              @Override protected void onStartListening(Intent intent, Callback callback) {
+                  try { callback.error(SpeechRecognizer.ERROR_CLIENT); } catch (Exception ignored) { }
+              }
+              @Override protected void onCancel(Callback callback) { }
+              @Override protected void onStopListening(Callback callback) { }
+          }
+          EOF
           cat > native/patch-android.js <<'EOF'
-          // Run after `cap add android`. Copies the alarm plugin in, registers it, and adds the permissions ECHO-1 needs. Safe to run again.
+          // Run after `cap add android`. Copies the native plugins in, registers them, adds the assistant bubble, and adds the permissions ECHO-1 needs. Safe to run again.
           const fs = require("fs"), path = require("path");
           const root = path.join(__dirname, "..", "android", "app", "src", "main");
           const pkgDir = path.join(root, "java", "com", "echo1", "app");
           if (!fs.existsSync(root)) { console.error("Run `npx cap add android` first."); process.exit(1); }
           fs.mkdirSync(pkgDir, { recursive: true });
-          ["AlarmPlugin.java", "LauncherPlugin.java"].forEach((f) => fs.copyFileSync(path.join(__dirname, f), path.join(pkgDir, f)));
+          ["AlarmPlugin", "LauncherPlugin", "AssistPlugin", "AssistActivity", "EchoAssistService", "EchoSessionService", "EchoSession", "EchoRecognitionService"]
+            .forEach((f) => fs.copyFileSync(path.join(__dirname, f + ".java"), path.join(pkgDir, f + ".java")));
           fs.writeFileSync(path.join(pkgDir, "MainActivity.java"), `package com.echo1.app;
 
+          import android.content.Intent;
           import android.os.Bundle;
           import com.getcapacitor.BridgeActivity;
 
@@ -160,20 +479,79 @@ jobs:
               public void onCreate(Bundle savedInstanceState) {
                   registerPlugin(AlarmPlugin.class);
                   registerPlugin(LauncherPlugin.class);
+                  registerPlugin(AssistPlugin.class);
                   super.onCreate(savedInstanceState);
+                  takeAssist(getIntent(), false);
+              }
+
+              @Override
+              protected void onNewIntent(Intent intent) {
+                  super.onNewIntent(intent);
+                  setIntent(intent);
+                  takeAssist(intent, true);
+              }
+
+              // The assistant bubble sends what you said here. The web app picks it up and answers.
+              private void takeAssist(Intent i, boolean live) {
+                  if (i == null) return;
+                  String q = i.getStringExtra("echo_query");
+                  if (q == null || q.trim().isEmpty()) return;
+                  i.removeExtra("echo_query");
+                  AssistPlugin.pending = q.trim();
+                  if (live && getBridge() != null) getBridge().triggerDocumentJSEvent("echoassist");
               }
           }
           `);
+
+          const resDir = path.join(root, "res");
+          fs.mkdirSync(path.join(resDir, "xml"), { recursive: true });
+          fs.mkdirSync(path.join(resDir, "values"), { recursive: true });
+          fs.writeFileSync(path.join(resDir, "xml", "echo_assistant.xml"), `<?xml version="1.0" encoding="utf-8"?>
+          <voice-interaction-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:sessionService="com.echo1.app.EchoSessionService"
+              android:recognitionService="com.echo1.app.EchoRecognitionService"
+              android:supportsAssist="true"
+              android:supportsLaunchVoiceAssistFromKeyguard="true" />
+          `);
+          fs.writeFileSync(path.join(resDir, "xml", "echo_recognizer.xml"), `<?xml version="1.0" encoding="utf-8"?>
+          <recognition-service xmlns:android="http://schemas.android.com/apk/res/android" />
+          `);
+          fs.writeFileSync(path.join(resDir, "values", "echo_styles.xml"), `<?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="EchoBubble" parent="@android:style/Theme.Translucent.NoTitleBar">
+                  <item name="android:windowIsTranslucent">true</item>
+                  <item name="android:windowBackground">@android:color/transparent</item>
+                  <item name="android:windowAnimationStyle">@android:style/Animation.Activity</item>
+              </style>
+          </resources>
+          `);
+
           const mf = path.join(root, "AndroidManifest.xml");
           let x = fs.readFileSync(mf, "utf8");
           ["android.permission.INTERNET", "android.permission.RECORD_AUDIO", "android.permission.MODIFY_AUDIO_SETTINGS",
            "android.permission.ACCESS_FINE_LOCATION", "android.permission.ACCESS_COARSE_LOCATION",
            "android.permission.POST_NOTIFICATIONS", "android.permission.VIBRATE", "com.android.alarm.permission.SET_ALARM"
           ].forEach((p) => { if (!x.includes('"' + p + '"')) x = x.replace("</manifest>", '    <uses-permission android:name="' + p + '" />\n</manifest>'); });
-          // Lets the app see and open other installed apps (Android 11+ hides them otherwise).
-          if (!x.includes("<queries>")) x = x.replace("<application", '<queries>\n        <intent><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent>\n        <intent><action android:name="android.intent.action.VIEW" /><data android:scheme="https" /></intent>\n    </queries>\n\n    <application');
+          // Lets the app see and open other installed apps, and find the speech engine (Android 11+ hides them otherwise).
+          if (!x.includes("<queries>")) x = x.replace("<application", '<queries>\n        <intent><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent>\n        <intent><action android:name="android.intent.action.VIEW" /><data android:scheme="https" /></intent>\n        <intent><action android:name="android.speech.RecognitionService" /></intent>\n    </queries>\n\n    <application');
+          // The assistant: shows ECHO-1 in Settings > Digital assistant app, and opens the bubble.
+          if (!x.includes(".EchoAssistService")) {
+            x = x.replace("</application>", `
+                  <service android:name=".EchoAssistService" android:permission="android.permission.BIND_VOICE_INTERACTION" android:exported="true">
+                      <meta-data android:name="android.voice_interaction" android:resource="@xml/echo_assistant" />
+                      <intent-filter><action android:name="android.service.voice.VoiceInteractionService" /></intent-filter>
+                  </service>
+                  <service android:name=".EchoSessionService" android:permission="android.permission.BIND_VOICE_INTERACTION" android:exported="true" />
+                  <service android:name=".EchoRecognitionService" android:exported="true">
+                      <intent-filter><action android:name="android.speech.RecognitionService" /><category android:name="android.intent.category.DEFAULT" /></intent-filter>
+                      <meta-data android:name="android.speech" android:resource="@xml/echo_recognizer" />
+                  </service>
+                  <activity android:name=".AssistActivity" android:theme="@style/EchoBubble" android:exported="true" android:excludeFromRecents="true"
+                      android:launchMode="singleTask" android:taskAffinity="" android:windowSoftInputMode="adjustResize" />
+              </application>`);
+          }
           fs.writeFileSync(mf, x);
-          console.log("Android project patched: alarm plugin + permissions.");
+          console.log("Android project patched: alarm, launcher, assistant bubble + permissions.");
           EOF
           cat > native/make-icons.py <<'EOF'
           # Builds the Android launcher icons from the ECHO-1 icons on your website. Usage: python3 make-icons.py https://your-site
@@ -214,6 +592,11 @@ jobs:
               open(os.path.join(res, "mipmap-anydpi-v26", n), "w").write(xml)
           print("ECHO-1 icons written, background", hexbg)
           EOF
+      - name: Use the same signing key (so a new build installs over the old app)
+        env:
+          KS: ${{ secrets.DEBUG_KEYSTORE_B64 }}
+        run: |
+          if [ -n "$KS" ]; then mkdir -p ~/.android && echo "$KS" | base64 -d > ~/.android/debug.keystore && echo "Using saved signing key"; else echo "No saved key. Uninstall the old app before installing this one."; fi
       - name: Build the Android app
         working-directory: app
         env:
@@ -225,6 +608,7 @@ jobs:
           pip install --quiet pillow
           python3 native/make-icons.py "$ECHO_URL" || echo "Icon step skipped, using the default icon"
           npx cap sync android
+          sed -i "s/versionCode 1/versionCode ${{ github.run_number }}/; s/versionName \"1.0\"/versionName \"1.${{ github.run_number }}\"/" android/app/build.gradle || true
           cd android
           chmod +x gradlew
           ./gradlew assembleDebug
