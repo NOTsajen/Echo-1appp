@@ -146,6 +146,8 @@ jobs:
           package com.echo1.app;
 
           import android.content.Intent;
+          import android.net.Uri;
+          import android.os.Build;
           import android.provider.Settings;
           import com.getcapacitor.JSObject;
           import com.getcapacitor.Plugin;
@@ -190,25 +192,184 @@ jobs:
                   }
                   call.reject("Could not open settings");
               }
+
+              @PluginMethod
+              public void canOverlay(PluginCall call) {
+                  JSObject r = new JSObject();
+                  r.put("value", Build.VERSION.SDK_INT < 23 || Settings.canDrawOverlays(getContext()));
+                  call.resolve(r);
+              }
+
+              @PluginMethod
+              public void requestOverlay(PluginCall call) {
+                  try {
+                      getContext().startActivity(new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:" + getContext().getPackageName()))
+                          .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+                      call.resolve();
+                  } catch (Exception e) { call.reject("Could not open the permission page"); }
+              }
+
+              @PluginMethod
+              public void showBubble(PluginCall call) {
+                  if (Build.VERSION.SDK_INT >= 23 && !Settings.canDrawOverlays(getContext())) { call.reject("Overlay permission is off"); return; }
+                  try {
+                      Intent i = new Intent(getContext(), BubbleService.class);
+                      if (Build.VERSION.SDK_INT >= 26) getContext().startForegroundService(i); else getContext().startService(i);
+                      call.resolve();
+                  } catch (Exception e) { call.reject("Could not start the bubble"); }
+              }
+
+              @PluginMethod
+              public void hideBubble(PluginCall call) {
+                  try { getContext().stopService(new Intent(getContext(), BubbleService.class)); } catch (Exception ignored) { }
+                  call.resolve();
+              }
+          }
+          EOF
+          cat > native/BubbleService.java <<'EOF'
+          package com.echo1.app;
+
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.app.Service;
+          import android.content.Intent;
+          import android.content.pm.ServiceInfo;
+          import android.graphics.PixelFormat;
+          import android.graphics.drawable.GradientDrawable;
+          import android.os.Build;
+          import android.os.IBinder;
+          import android.view.Gravity;
+          import android.view.MotionEvent;
+          import android.view.View;
+          import android.view.WindowManager;
+          import android.widget.ImageView;
+
+          /** A small ECHO-1 bubble that floats over other apps. Drag it anywhere. Tap it to ask. */
+          public class BubbleService extends Service {
+              private WindowManager wm;
+              private View bubble;
+
+              @Override public IBinder onBind(Intent i) { return null; }
+
+              private int dp(int v) { return Math.round(v * getResources().getDisplayMetrics().density); }
+
+              @Override
+              public int onStartCommand(Intent intent, int flags, int startId) {
+                  if (intent != null && "STOP".equals(intent.getAction())) { stopSelf(); return START_NOT_STICKY; }
+                  goForeground();
+                  if (bubble == null) addBubble();
+                  return START_STICKY;
+              }
+
+              private void goForeground() {
+                  String ch = "echo_bubble";
+                  NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+                  if (Build.VERSION.SDK_INT >= 26 && nm.getNotificationChannel(ch) == null) {
+                      nm.createNotificationChannel(new NotificationChannel(ch, "ECHO-1 bubble", NotificationManager.IMPORTANCE_MIN));
+                  }
+                  PendingIntent hide = PendingIntent.getService(this, 1, new Intent(this, BubbleService.class).setAction("STOP"),
+                      PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+                  Notification.Builder nb = Build.VERSION.SDK_INT >= 26 ? new Notification.Builder(this, ch) : new Notification.Builder(this);
+                  nb.setContentTitle("ECHO-1 bubble is on")
+                    .setContentText("Tap the bubble to ask. Tap here to hide it.")
+                    .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+                    .setContentIntent(hide)
+                    .setOngoing(true);
+                  Notification n = nb.build();
+                  if (Build.VERSION.SDK_INT >= 34) startForeground(7, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
+                  else startForeground(7, n);
+              }
+
+              private void addBubble() {
+                  wm = (WindowManager) getSystemService(WINDOW_SERVICE);
+                  int size = dp(56);
+                  ImageView v = new ImageView(this);
+                  v.setImageResource(R.drawable.echo_widget_icon);
+                  v.setScaleType(ImageView.ScaleType.FIT_CENTER);
+                  v.setPadding(dp(3), dp(3), dp(3), dp(3));
+                  GradientDrawable bg = new GradientDrawable();
+                  bg.setShape(GradientDrawable.OVAL);
+                  bg.setColor(0xFF14101F);
+                  bg.setStroke(dp(2), 0xFFC8F43A);
+                  v.setBackground(bg);
+
+                  final WindowManager.LayoutParams lp = new WindowManager.LayoutParams(size, size,
+                      Build.VERSION.SDK_INT >= 26 ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY : WindowManager.LayoutParams.TYPE_PHONE,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                      PixelFormat.TRANSLUCENT);
+                  lp.gravity = Gravity.TOP | Gravity.START;
+                  lp.x = dp(12);
+                  lp.y = dp(240);
+
+                  v.setOnTouchListener(new View.OnTouchListener() {
+                      float downX, downY; int startX, startY; boolean moved;
+                      @Override public boolean onTouch(View view, MotionEvent e) {
+                          switch (e.getAction()) {
+                              case MotionEvent.ACTION_DOWN:
+                                  downX = e.getRawX(); downY = e.getRawY(); startX = lp.x; startY = lp.y; moved = false; return true;
+                              case MotionEvent.ACTION_MOVE:
+                                  if (Math.abs(e.getRawX() - downX) > dp(8) || Math.abs(e.getRawY() - downY) > dp(8)) moved = true;
+                                  if (moved) {
+                                      lp.x = startX + Math.round(e.getRawX() - downX);
+                                      lp.y = startY + Math.round(e.getRawY() - downY);
+                                      try { wm.updateViewLayout(bubble, lp); } catch (Exception ignored) { }
+                                  }
+                                  return true;
+                              case MotionEvent.ACTION_UP:
+                                  if (!moved) {
+                                      try {
+                                          startActivity(new Intent(BubbleService.this, AssistActivity.class)
+                                              .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP));
+                                      } catch (Exception ignored) { }
+                                  }
+                                  return true;
+                          }
+                          return false;
+                      }
+                  });
+                  bubble = v;
+                  try { wm.addView(bubble, lp); } catch (Exception e) { bubble = null; stopSelf(); }
+              }
+
+              @Override
+              public void onDestroy() {
+                  super.onDestroy();
+                  try { if (wm != null && bubble != null) wm.removeView(bubble); } catch (Exception ignored) { }
+                  bubble = null;
+              }
           }
           EOF
           cat > native/AssistActivity.java <<'EOF'
           package com.echo1.app;
 
           import android.Manifest;
+          import android.animation.ObjectAnimator;
           import android.app.Activity;
+          import android.content.ActivityNotFoundException;
           import android.content.ComponentName;
+          import android.content.Context;
           import android.content.Intent;
           import android.content.pm.PackageManager;
+          import android.graphics.Canvas;
           import android.graphics.Color;
+          import android.graphics.Paint;
+          import android.graphics.Path;
+          import android.graphics.RectF;
           import android.graphics.Typeface;
           import android.graphics.drawable.GradientDrawable;
+          import android.os.Build;
           import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
           import android.speech.RecognitionListener;
           import android.speech.RecognizerIntent;
           import android.speech.SpeechRecognizer;
           import android.view.Gravity;
+          import android.view.View;
           import android.view.ViewGroup;
+          import android.view.WindowInsets;
           import android.view.WindowManager;
           import android.view.inputmethod.EditorInfo;
           import android.widget.EditText;
@@ -217,63 +378,135 @@ jobs:
           import android.widget.TextView;
           import java.util.ArrayList;
 
-          /** The ECHO-1 bubble: speak or type, then ECHO-1 opens and answers. */
+          /** The ECHO-1 bubble: speak or type, then ECHO-1 opens and answers. Styled like the ECHO-1 app (deep violet, lime accent). */
           public class AssistActivity extends Activity implements RecognitionListener {
+              // ECHO-1 app colours
+              private static final int CARD = 0xFF150F2B, INK = 0xFFF4F1FF, INK2 = 0x9EF4F1FF, LINE = 0x24FFFFFF, FIELD = 0x14FFFFFF;
+              private static final int ACCENT = 0xFFC8F43A, ACCENT2 = 0xFF7B5CFF, ON_ACCENT = 0xFF14101F;
+              private static final int REQ_MIC = 7, REQ_DIALOG = 8;
+
               private SpeechRecognizer rec;
               private EditText input;
-              private TextView status, mic;
-              private boolean listening = false, triedDefault = false;
+              private TextView status;
+              private IconView orb;
+              private View halo;
+              private LinearLayout card;
+              private ObjectAnimator pulse;
+              private boolean listening = false;
+              private int attempt = 0;   // 0 = Google's speech engine, 1 = the phone's default engine, 2 = the phone's own voice window
+              private final Handler h = new Handler(Looper.getMainLooper());
 
               private int dp(int v) { return Math.round(v * getResources().getDisplayMetrics().density); }
 
-              private TextView circle(String label, int color) {
-                  TextView t = new TextView(this);
-                  t.setText(label);
-                  t.setTextSize(20);
-                  t.setGravity(Gravity.CENTER);
-                  t.setTextColor(Color.WHITE);
+              private GradientDrawable oval(int fill, int stroke, int strokeDp) {
                   GradientDrawable g = new GradientDrawable();
                   g.setShape(GradientDrawable.OVAL);
-                  g.setColor(color);
-                  t.setBackground(g);
-                  LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(dp(48), dp(48));
-                  lp.leftMargin = dp(8);
-                  t.setLayoutParams(lp);
-                  return t;
+                  g.setColor(fill);
+                  if (strokeDp > 0) g.setStroke(dp(strokeDp), stroke);
+                  return g;
+              }
+
+              /** Small icons drawn in code, so the bubble needs no image files. */
+              static class IconView extends View {
+                  static final int MIC = 0, STOP = 1, SEND = 2;
+                  private int kind;
+                  private final int color;
+                  private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+                  private final Path path = new Path();
+                  private final RectF rf = new RectF();
+
+                  IconView(Context c, int kind, int color) { super(c); this.kind = kind; this.color = color; }
+
+                  void setKind(int k) { kind = k; invalidate(); }
+
+                  @Override
+                  protected void onDraw(Canvas cv) {
+                      float w = getWidth(), hh = getHeight(), s = Math.min(w, hh), cx = w / 2f, cy = hh / 2f;
+                      p.setColor(color);
+                      p.setStrokeCap(Paint.Cap.ROUND);
+                      p.setStrokeJoin(Paint.Join.ROUND);
+                      if (kind == STOP) {
+                          p.setStyle(Paint.Style.FILL);
+                          rf.set(cx - s * 0.15f, cy - s * 0.15f, cx + s * 0.15f, cy + s * 0.15f);
+                          cv.drawRoundRect(rf, s * 0.05f, s * 0.05f, p);
+                          return;
+                      }
+                      p.setStyle(Paint.Style.STROKE);
+                      p.setStrokeWidth(s * 0.075f);
+                      if (kind == SEND) {
+                          path.reset();
+                          path.moveTo(cx, cy + s * 0.2f);
+                          path.lineTo(cx, cy - s * 0.2f);
+                          path.moveTo(cx - s * 0.17f, cy - s * 0.03f);
+                          path.lineTo(cx, cy - s * 0.2f);
+                          path.lineTo(cx + s * 0.17f, cy - s * 0.03f);
+                          cv.drawPath(path, p);
+                          return;
+                      }
+                      rf.set(cx - s * 0.1f, cy - s * 0.27f, cx + s * 0.1f, cy + s * 0.07f);
+                      cv.drawRoundRect(rf, s * 0.1f, s * 0.1f, p);
+                      rf.set(cx - s * 0.19f, cy - s * 0.12f, cx + s * 0.19f, cy + s * 0.2f);
+                      cv.drawArc(rf, 0, 180, false, p);
+                      cv.drawLine(cx, cy + s * 0.2f, cx, cy + s * 0.29f, p);
+                      cv.drawLine(cx - s * 0.1f, cy + s * 0.29f, cx + s * 0.1f, cy + s * 0.29f, p);
+                  }
               }
 
               @Override
               protected void onCreate(Bundle b) {
                   super.onCreate(b);
                   getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
+                  try { getWindow().setNavigationBarColor(CARD); } catch (Exception ignored) { }
 
                   FrameLayout root = new FrameLayout(this);
-                  root.setBackgroundColor(0x88000000);
+                  root.setBackgroundColor(0x99000000);
                   root.setOnClickListener(v -> finish());
 
-                  LinearLayout card = new LinearLayout(this);
+                  card = new LinearLayout(this);
                   card.setOrientation(LinearLayout.VERTICAL);
-                  card.setPadding(dp(20), dp(18), dp(20), dp(22));
+                  card.setPadding(dp(20), dp(12), dp(20), dp(22));
                   GradientDrawable bg = new GradientDrawable();
-                  bg.setColor(0xFF1A1633);
+                  bg.setColor(CARD);
+                  bg.setStroke(dp(1), LINE);
                   float r = dp(28);
                   bg.setCornerRadii(new float[] { r, r, r, r, 0, 0, 0, 0 });
                   card.setBackground(bg);
                   card.setClickable(true);
                   root.addView(card, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM));
 
+                  // The card sits above the phone's navigation bar and the keyboard, so nothing is cut off.
+                  root.setOnApplyWindowInsetsListener((v, insets) -> {
+                      int bottom;
+                      if (Build.VERSION.SDK_INT >= 30) bottom = insets.getInsets(WindowInsets.Type.systemBars() | WindowInsets.Type.ime()).bottom;
+                      else bottom = insets.getSystemWindowInsetBottom();
+                      card.setPadding(dp(20), dp(12), dp(20), dp(22) + bottom);
+                      return insets;
+                  });
+
+                  View handle = new View(this);
+                  GradientDrawable hg = new GradientDrawable();
+                  hg.setColor(0x33F4F1FF);
+                  hg.setCornerRadius(dp(2));
+                  handle.setBackground(hg);
+                  LinearLayout.LayoutParams hlp = new LinearLayout.LayoutParams(dp(40), dp(4));
+                  hlp.gravity = Gravity.CENTER_HORIZONTAL;
+                  hlp.bottomMargin = dp(16);
+                  card.addView(handle, hlp);
+
                   TextView title = new TextView(this);
                   title.setText("ECHO-1");
-                  title.setTextColor(0xFF8FA81F);
-                  title.setTextSize(14);
-                  title.setTypeface(Typeface.DEFAULT_BOLD);
+                  title.setTextColor(ACCENT);
+                  title.setTextSize(13);
+                  title.setLetterSpacing(0.14f);
+                  title.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
                   card.addView(title);
 
                   status = new TextView(this);
                   status.setText("Listening…");
-                  status.setTextColor(0xFFF4F1FF);
-                  status.setTextSize(18);
-                  status.setPadding(0, dp(8), 0, dp(12));
+                  status.setTextColor(INK);
+                  status.setTextSize(19);
+                  status.setTypeface(Typeface.create("sans-serif", Typeface.NORMAL));
+                  status.setPadding(0, dp(6), 0, dp(16));
                   card.addView(status);
 
                   LinearLayout row = new LinearLayout(this);
@@ -283,48 +516,100 @@ jobs:
 
                   input = new EditText(this);
                   input.setHint("Type or tap the mic");
-                  input.setHintTextColor(0x88F4F1FF);
-                  input.setTextColor(0xFFF4F1FF);
+                  input.setHintTextColor(INK2);
+                  input.setTextColor(INK);
+                  input.setHighlightColor(0x557B5CFF);
+                  input.setTextSize(16);
                   input.setSingleLine(true);
                   input.setImeOptions(EditorInfo.IME_ACTION_SEND);
+                  input.setPadding(dp(18), 0, dp(18), 0);
+                  GradientDrawable ig = new GradientDrawable();
+                  ig.setColor(FIELD);
+                  ig.setStroke(dp(1), LINE);
+                  ig.setCornerRadius(dp(26));
+                  input.setBackground(ig);
                   input.setOnEditorActionListener((v, a, e) -> { submit(); return true; });
-                  row.addView(input, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+                  row.addView(input, new LinearLayout.LayoutParams(0, dp(52), 1f));
 
-                  mic = circle("🎤", 0xFF4B3FA0);
-                  mic.setOnClickListener(v -> { if (listening) stopListening(); else startListening(); });
-                  row.addView(mic);
+                  FrameLayout orbBox = new FrameLayout(this);
+                  LinearLayout.LayoutParams olp = new LinearLayout.LayoutParams(dp(58), dp(58));
+                  olp.leftMargin = dp(8);
+                  row.addView(orbBox, olp);
+                  halo = new View(this);
+                  halo.setBackground(oval(0x667B5CFF, 0, 0));
+                  halo.setVisibility(View.INVISIBLE);
+                  orbBox.addView(halo, new FrameLayout.LayoutParams(dp(48), dp(48), Gravity.CENTER));
+                  orb = new IconView(this, IconView.MIC, INK);
+                  orb.setBackground(oval(ACCENT2, LINE, 1));
+                  orb.setOnClickListener(v -> { if (listening) stopListening(); else startListening(); });
+                  orbBox.addView(orb, new FrameLayout.LayoutParams(dp(48), dp(48), Gravity.CENTER));
 
-                  TextView send = circle("➤", 0xFF8FA81F);
+                  IconView send = new IconView(this, IconView.SEND, ON_ACCENT);
+                  send.setBackground(oval(ACCENT, 0, 0));
                   send.setOnClickListener(v -> submit());
-                  row.addView(send);
+                  LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(dp(48), dp(48));
+                  slp.leftMargin = dp(2);
+                  row.addView(send, slp);
 
                   setContentView(root);
                   root.post(this::startListening);
               }
 
+              private void setStatus(String s) { status.setText(s); }
+
+              private void setListeningUi(boolean on) {
+                  listening = on;
+                  orb.setKind(on ? IconView.STOP : IconView.MIC);
+                  orb.setBackground(on ? oval(ACCENT2, ACCENT, 2) : oval(ACCENT2, LINE, 1));
+                  if (on) {
+                      halo.setVisibility(View.VISIBLE);
+                      if (pulse == null) {
+                          pulse = ObjectAnimator.ofFloat(halo, "alpha", 0.25f, 1f);
+                          pulse.setDuration(900);
+                          pulse.setRepeatCount(ObjectAnimator.INFINITE);
+                          pulse.setRepeatMode(ObjectAnimator.REVERSE);
+                      }
+                      pulse.start();
+                  } else {
+                      if (pulse != null) pulse.cancel();
+                      halo.setVisibility(View.INVISIBLE);
+                      halo.setScaleX(1f);
+                      halo.setScaleY(1f);
+                  }
+              }
+
               private void startListening() {
+                  if (isFinishing() || listening) return;
                   if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-                      requestPermissions(new String[] { Manifest.permission.RECORD_AUDIO }, 7);
+                      requestPermissions(new String[] { Manifest.permission.RECORD_AUDIO }, REQ_MIC);
                       return;
                   }
+                  if (attempt >= 2 || !SpeechRecognizer.isRecognitionAvailable(this)) { openVoiceWindow(); return; }
                   try {
-                      if (rec == null) makeRecognizer(false);
+                      makeRecognizer(attempt == 1);
                       Intent i = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
                           .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                          .putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
-                      listening = true;
-                      status.setText("Listening…");
-                      mic.setText("■");
+                          .putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+                          .putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, getPackageName());
+                      setStatus("Listening…");
+                      setListeningUi(true);
                       rec.startListening(i);
                   } catch (Exception e) {
-                      listening = false;
-                      mic.setText("🎤");
-                      status.setText("Voice isn't available. Type instead.");
+                      setListeningUi(false);
+                      nextEngine();
+                  }
+              }
+
+              private void destroyRecognizer() {
+                  if (rec != null) {
+                      try { rec.cancel(); } catch (Exception ignored) { }
+                      try { rec.destroy(); } catch (Exception ignored) { }
+                      rec = null;
                   }
               }
 
               private void makeRecognizer(boolean useDefault) {
-                  if (rec != null) { rec.destroy(); rec = null; }
+                  destroyRecognizer();   // a fresh one every time avoids "too many requests" (code 10)
                   if (!useDefault) {
                       try {
                           // If ECHO-1 is the assistant, Android's default speech engine can point back at ECHO-1. Ask Google's directly.
@@ -336,15 +621,37 @@ jobs:
                   rec.setRecognitionListener(this);
               }
 
+              /** The speech engine had a problem: try the next way of listening. */
+              private void nextEngine() {
+                  attempt++;
+                  destroyRecognizer();
+                  if (attempt >= 2) { openVoiceWindow(); return; }
+                  setStatus("One moment…");
+                  h.postDelayed(this::startListening, 700);
+              }
+
+              /** Last resort that works on almost every phone: the phone's own voice window. */
+              private void openVoiceWindow() {
+                  try {
+                      Intent i = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+                          .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                          .putExtra(RecognizerIntent.EXTRA_PROMPT, "Say it to ECHO-1");
+                      startActivityForResult(i, REQ_DIALOG);
+                  } catch (ActivityNotFoundException e) {
+                      setStatus("Voice isn't available on this phone. Type instead.");
+                  } catch (Exception e) {
+                      setStatus("Voice isn't available right now. Type instead.");
+                  }
+              }
+
               private void stopListening() {
-                  listening = false;
-                  mic.setText("🎤");
+                  setListeningUi(false);
                   try { if (rec != null) rec.stopListening(); } catch (Exception ignored) { }
               }
 
               private void submit() {
                   String q = input.getText().toString().trim();
-                  if (q.isEmpty()) { status.setText("Say or type something first."); return; }
+                  if (q.isEmpty()) { setStatus("Say or type something first."); return; }
                   Intent i = new Intent(this, MainActivity.class)
                       .putExtra("echo_query", q)
                       .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
@@ -352,47 +659,66 @@ jobs:
                   finish();
               }
 
-              @Override public void onRequestPermissionsResult(int code, String[] perms, int[] results) {
+              @Override
+              public void onRequestPermissionsResult(int code, String[] perms, int[] results) {
                   super.onRequestPermissionsResult(code, perms, results);
                   if (results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED) startListening();
-                  else status.setText("Mic permission is off. Type instead, or allow it in Settings.");
+                  else setStatus("Mic permission is off. Type instead, or allow it in Settings.");
               }
 
-              @Override public void onResults(Bundle results) {
-                  listening = false;
-                  mic.setText("🎤");
+              @Override
+              protected void onActivityResult(int code, int result, Intent data) {
+                  super.onActivityResult(code, result, data);
+                  if (code != REQ_DIALOG) return;
+                  ArrayList<String> list = (result == RESULT_OK && data != null) ? data.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS) : null;
+                  if (list != null && !list.isEmpty()) { input.setText(list.get(0)); submit(); }
+                  else setStatus("Didn't catch that. Tap the mic to try again.");
+              }
+
+              @Override
+              public void onResults(Bundle results) {
+                  setListeningUi(false);
                   ArrayList<String> list = results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
                   if (list != null && !list.isEmpty()) { input.setText(list.get(0)); submit(); }
-                  else status.setText("Didn't catch that. Tap the mic to try again.");
+                  else setStatus("Didn't catch that. Tap the mic to try again.");
               }
 
-              @Override public void onPartialResults(Bundle partial) {
+              @Override
+              public void onPartialResults(Bundle partial) {
                   ArrayList<String> list = partial.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
                   if (list != null && !list.isEmpty()) { input.setText(list.get(0)); input.setSelection(input.getText().length()); }
               }
 
-              @Override public void onError(int error) {
-                  listening = false;
-                  mic.setText("🎤");
-                  if ((error == SpeechRecognizer.ERROR_CLIENT || error == 11) && !triedDefault) {   // Google's engine not reachable: try the phone's default once
-                      triedDefault = true;
-                      try { makeRecognizer(true); startListening(); return; } catch (Exception ignored) { }
-                  }
-                  if (error == SpeechRecognizer.ERROR_NO_MATCH || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT) status.setText("Didn't catch that. Tap the mic to try again.");
-                  else if (error == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) status.setText("Mic permission is off. Type instead.");
-                  else status.setText("Voice problem (code " + error + "). Type instead.");
+              @Override
+              public void onError(int error) {
+                  setListeningUi(false);
+                  if (error == SpeechRecognizer.ERROR_NO_MATCH || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT) { setStatus("Didn't catch that. Tap the mic to try again."); return; }
+                  if (error == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) { setStatus("Mic permission is off. Type instead."); return; }
+                  if (error == SpeechRecognizer.ERROR_NETWORK || error == SpeechRecognizer.ERROR_NETWORK_TIMEOUT) { setStatus("No internet for voice. Type instead."); return; }
+                  if (error == SpeechRecognizer.ERROR_AUDIO) { setStatus("The microphone is busy. Close other apps using it and try again."); return; }
+                  nextEngine();   // engine problems (codes 4, 5, 8, 10, 11, 12, 13 ...): switch engine instead of giving up
+              }
+
+              @Override
+              public void onRmsChanged(float rms) {
+                  if (!listening) return;
+                  float lvl = Math.max(0f, Math.min(10f, rms)) / 10f;
+                  halo.setScaleX(1f + 0.16f * lvl);
+                  halo.setScaleY(1f + 0.16f * lvl);
               }
 
               @Override public void onReadyForSpeech(Bundle p) { }
               @Override public void onBeginningOfSpeech() { }
-              @Override public void onRmsChanged(float rms) { }
               @Override public void onBufferReceived(byte[] buf) { }
               @Override public void onEndOfSpeech() { }
               @Override public void onEvent(int type, Bundle p) { }
 
-              @Override protected void onDestroy() {
+              @Override
+              protected void onDestroy() {
                   super.onDestroy();
-                  try { if (rec != null) rec.destroy(); } catch (Exception ignored) { }
+                  h.removeCallbacksAndMessages(null);
+                  if (pulse != null) pulse.cancel();
+                  destroyRecognizer();
               }
           }
           EOF
@@ -459,6 +785,30 @@ jobs:
               @Override protected void onStopListening(Callback callback) { }
           }
           EOF
+          cat > native/EchoWidget.java <<'EOF'
+          package com.echo1.app;
+
+          import android.app.PendingIntent;
+          import android.appwidget.AppWidgetManager;
+          import android.appwidget.AppWidgetProvider;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.widget.RemoteViews;
+
+          /** Home screen widget. Tap it to open the ECHO-1 bubble. */
+          public class EchoWidget extends AppWidgetProvider {
+              @Override
+              public void onUpdate(Context ctx, AppWidgetManager mgr, int[] ids) {
+                  Intent open = new Intent(ctx, AssistActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+                  PendingIntent pi = PendingIntent.getActivity(ctx, 0, open, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+                  for (int id : ids) {
+                      RemoteViews rv = new RemoteViews(ctx.getPackageName(), R.layout.echo_widget);
+                      rv.setOnClickPendingIntent(R.id.echo_widget_root, pi);
+                      mgr.updateAppWidget(id, rv);
+                  }
+              }
+          }
+          EOF
           cat > native/patch-android.js <<'EOF'
           // Run after `cap add android`. Copies the native plugins in, registers them, adds the assistant bubble, and adds the permissions ECHO-1 needs. Safe to run again.
           const fs = require("fs"), path = require("path");
@@ -466,7 +816,7 @@ jobs:
           const pkgDir = path.join(root, "java", "com", "echo1", "app");
           if (!fs.existsSync(root)) { console.error("Run `npx cap add android` first."); process.exit(1); }
           fs.mkdirSync(pkgDir, { recursive: true });
-          ["AlarmPlugin", "LauncherPlugin", "AssistPlugin", "AssistActivity", "EchoAssistService", "EchoSessionService", "EchoSession", "EchoRecognitionService"]
+          ["AlarmPlugin", "LauncherPlugin", "AssistPlugin", "AssistActivity", "EchoAssistService", "EchoSessionService", "EchoSession", "EchoRecognitionService", "EchoWidget", "BubbleService"]
             .forEach((f) => fs.copyFileSync(path.join(__dirname, f + ".java"), path.join(pkgDir, f + ".java")));
           fs.writeFileSync(path.join(pkgDir, "MainActivity.java"), `package com.echo1.app;
 
@@ -526,11 +876,51 @@ jobs:
           </resources>
           `);
 
+          fs.mkdirSync(path.join(resDir, "layout"), { recursive: true });
+          fs.mkdirSync(path.join(resDir, "drawable"), { recursive: true });
+          fs.writeFileSync(path.join(resDir, "drawable", "echo_widget_bg.xml"), `<?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="oval">
+              <solid android:color="#FF14101F" />
+              <stroke android:width="3dp" android:color="#FFC8F43A" />
+          </shape>
+          `);
+          fs.mkdirSync(path.join(resDir, "drawable-nodpi"), { recursive: true });
+          const iconPng = path.join(resDir, "drawable-nodpi", "echo_widget_icon.png");
+          if (!fs.existsSync(iconPng)) fs.writeFileSync(iconPng, Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAYAAADED76LAAAAFklEQVR4nGP0tl/wnwEPYMInOXwUAAA9CQI5YwtZhAAAAABJRU5ErkJggg==", "base64"));   // placeholder, replaced by make-icons.py with your real icon
+          fs.writeFileSync(path.join(resDir, "layout", "echo_widget.xml"), `<?xml version="1.0" encoding="utf-8"?>
+          <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:id="@+id/echo_widget_root"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:padding="4dp">
+              <ImageView
+                  android:layout_width="match_parent"
+                  android:layout_height="match_parent"
+                  android:padding="3dp"
+                  android:scaleType="fitCenter"
+                  android:src="@drawable/echo_widget_icon"
+                  android:contentDescription="Ask ECHO-1"
+                  android:background="@drawable/echo_widget_bg" />
+          </FrameLayout>
+          `);
+          fs.writeFileSync(path.join(resDir, "xml", "echo_widget_info.xml"), `<?xml version="1.0" encoding="utf-8"?>
+          <appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
+              android:minWidth="56dp"
+              android:minHeight="56dp"
+              android:targetCellWidth="1"
+              android:targetCellHeight="1"
+              android:updatePeriodMillis="0"
+              android:resizeMode="none"
+              android:widgetCategory="home_screen"
+              android:initialLayout="@layout/echo_widget" />
+          `);
+
           const mf = path.join(root, "AndroidManifest.xml");
           let x = fs.readFileSync(mf, "utf8");
           ["android.permission.INTERNET", "android.permission.RECORD_AUDIO", "android.permission.MODIFY_AUDIO_SETTINGS",
            "android.permission.ACCESS_FINE_LOCATION", "android.permission.ACCESS_COARSE_LOCATION",
-           "android.permission.POST_NOTIFICATIONS", "android.permission.VIBRATE", "com.android.alarm.permission.SET_ALARM"
+           "android.permission.POST_NOTIFICATIONS", "android.permission.VIBRATE", "com.android.alarm.permission.SET_ALARM",
+           "android.permission.SYSTEM_ALERT_WINDOW", "android.permission.FOREGROUND_SERVICE", "android.permission.FOREGROUND_SERVICE_SPECIAL_USE"
           ].forEach((p) => { if (!x.includes('"' + p + '"')) x = x.replace("</manifest>", '    <uses-permission android:name="' + p + '" />\n</manifest>'); });
           // Lets the app see and open other installed apps, and find the speech engine (Android 11+ hides them otherwise).
           if (!x.includes("<queries>")) x = x.replace("<application", '<queries>\n        <intent><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent>\n        <intent><action android:name="android.intent.action.VIEW" /><data android:scheme="https" /></intent>\n        <intent><action android:name="android.speech.RecognitionService" /></intent>\n    </queries>\n\n    <application');
@@ -548,6 +938,16 @@ jobs:
                   </service>
                   <activity android:name=".AssistActivity" android:theme="@style/EchoBubble" android:exported="true" android:excludeFromRecents="true"
                       android:launchMode="singleTask" android:taskAffinity="" android:windowSoftInputMode="adjustResize" />
+                  <activity-alias android:name=".AssistLauncher" android:targetActivity=".AssistActivity" android:label="ECHO Ask" android:icon="@mipmap/ic_launcher" android:exported="true">
+                      <intent-filter><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent-filter>
+                  </activity-alias>
+                  <receiver android:name=".EchoWidget" android:exported="true">
+                      <intent-filter><action android:name="android.appwidget.action.APPWIDGET_UPDATE" /></intent-filter>
+                      <meta-data android:name="android.appwidget.provider" android:resource="@xml/echo_widget_info" />
+                  </receiver>
+                  <service android:name=".BubbleService" android:exported="false" android:foregroundServiceType="specialUse">
+                      <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="Floating assistant shortcut" />
+                  </service>
               </application>`);
           }
           fs.writeFileSync(mf, x);
@@ -590,6 +990,12 @@ jobs:
                  '    <background android:drawable="@color/ic_launcher_background"/>\n    <foreground android:drawable="@mipmap/ic_launcher_foreground"/>\n</adaptive-icon>\n')
           for n in ("ic_launcher.xml", "ic_launcher_round.xml"):
               open(os.path.join(res, "mipmap-anydpi-v26", n), "w").write(xml)
+          # Round icon for the home screen widget
+          wd = os.path.join(res, "drawable-nodpi"); os.makedirs(wd, exist_ok=True)
+          m0 = int(icon.size[0] * 0.0625)
+          wi = icon.crop((m0, m0, icon.size[0] - m0, icon.size[0] - m0)).resize((256, 256), Image.LANCZOS)
+          wm = Image.new("L", (1024, 1024), 0); ImageDraw.Draw(wm).ellipse((0, 0, 1023, 1023), fill=255)
+          wi.putalpha(wm.resize((256, 256), Image.LANCZOS)); wi.save(os.path.join(wd, "echo_widget_icon.png"))
           print("ECHO-1 icons written, background", hexbg)
           EOF
       - name: Use the same signing key (so a new build installs over the old app)
