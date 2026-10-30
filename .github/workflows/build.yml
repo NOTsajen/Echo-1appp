@@ -4,8 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       url:
-        description: "Your Vercel address, e.g. https://my-echo.vercel.app"
+        description: "Your Vercel address, e.g. https://echo-1-nu.vercel.app"
         required: true
+        default: "https://echo-1-nu.vercel.app"
 
 jobs:
   build:
@@ -84,6 +85,60 @@ jobs:
               }
           }
           EOF
+          cat > native/LauncherPlugin.java <<'EOF'
+          package com.echo1.app;
+
+          import android.content.Intent;
+          import android.net.Uri;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+
+          /** Opens installed apps by package name, and store or other links. A website inside a WebView can't do this on its own. */
+          @CapacitorPlugin(name = "Launcher")
+          public class LauncherPlugin extends Plugin {
+
+              private boolean view(String uri) {
+                  try {
+                      Intent i = new Intent(Intent.ACTION_VIEW, Uri.parse(uri)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                      getContext().startActivity(i);
+                      return true;
+                  } catch (Exception e) { return false; }
+              }
+
+              /** Opens the app. If it is not installed, opens `fallback` if given, otherwise its Google Play page. */
+              @PluginMethod
+              public void launchPackage(PluginCall call) {
+                  String pkg = call.getString("package");
+                  String fallback = call.getString("fallback", "");
+                  if (pkg == null || pkg.isEmpty()) { call.reject("package is required"); return; }
+                  try {
+                      Intent i = getContext().getPackageManager().getLaunchIntentForPackage(pkg);
+                      if (i != null) {
+                          i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                          getContext().startActivity(i);
+                          call.resolve();
+                          return;
+                      }
+                  } catch (Exception ignored) { }
+                  if (fallback != null && !fallback.isEmpty() && view(fallback)) { call.resolve(); return; }
+                  if (view("market://details?id=" + pkg) || view("https://play.google.com/store/apps/details?id=" + pkg)) { call.resolve(); return; }
+                  call.reject("Could not open " + pkg);
+              }
+
+              /** Opens any link (market://, https://, a custom scheme). Falls back to `fallback` if nothing can open it. */
+              @PluginMethod
+              public void open(PluginCall call) {
+                  String uri = call.getString("uri");
+                  String fallback = call.getString("fallback", "");
+                  if (uri == null || uri.isEmpty()) { call.reject("uri is required"); return; }
+                  if (view(uri)) { call.resolve(); return; }
+                  if (fallback != null && !fallback.isEmpty() && view(fallback)) { call.resolve(); return; }
+                  call.reject("Nothing could open this link");
+              }
+          }
+          EOF
           cat > native/patch-android.js <<'EOF'
           // Run after `cap add android`. Copies the alarm plugin in, registers it, and adds the permissions ECHO-1 needs. Safe to run again.
           const fs = require("fs"), path = require("path");
@@ -91,7 +146,7 @@ jobs:
           const pkgDir = path.join(root, "java", "com", "echo1", "app");
           if (!fs.existsSync(root)) { console.error("Run `npx cap add android` first."); process.exit(1); }
           fs.mkdirSync(pkgDir, { recursive: true });
-          fs.copyFileSync(path.join(__dirname, "AlarmPlugin.java"), path.join(pkgDir, "AlarmPlugin.java"));
+          ["AlarmPlugin.java", "LauncherPlugin.java"].forEach((f) => fs.copyFileSync(path.join(__dirname, f), path.join(pkgDir, f)));
           fs.writeFileSync(path.join(pkgDir, "MainActivity.java"), `package com.echo1.app;
 
           import android.os.Bundle;
@@ -101,6 +156,7 @@ jobs:
               @Override
               public void onCreate(Bundle savedInstanceState) {
                   registerPlugin(AlarmPlugin.class);
+                  registerPlugin(LauncherPlugin.class);
                   super.onCreate(savedInstanceState);
               }
           }
@@ -111,15 +167,60 @@ jobs:
            "android.permission.ACCESS_FINE_LOCATION", "android.permission.ACCESS_COARSE_LOCATION",
            "android.permission.POST_NOTIFICATIONS", "android.permission.VIBRATE", "com.android.alarm.permission.SET_ALARM"
           ].forEach((p) => { if (!x.includes('"' + p + '"')) x = x.replace("</manifest>", '    <uses-permission android:name="' + p + '" />\n</manifest>'); });
+          // Lets the app see and open other installed apps (Android 11+ hides them otherwise).
+          if (!x.includes("<queries>")) x = x.replace("<application", '<queries>\n        <intent><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent>\n        <intent><action android:name="android.intent.action.VIEW" /><data android:scheme="https" /></intent>\n    </queries>\n\n    <application');
           fs.writeFileSync(mf, x);
           console.log("Android project patched: alarm plugin + permissions.");
           EOF
+          cat > native/make-icons.py <<'EOF'
+          # Builds the Android launcher icons from the ECHO-1 icons on your website. Usage: python3 make-icons.py https://your-site
+          import io, os, sys, urllib.request
+          from PIL import Image, ImageDraw
+
+          base = sys.argv[1].rstrip("/")
+          res = os.path.join("android", "app", "src", "main", "res")
+
+          def get(name):
+              with urllib.request.urlopen(base + "/" + name, timeout=30) as r:
+                  return Image.open(io.BytesIO(r.read())).convert("RGBA")
+
+          icon, mask = get("icon-512.png"), get("icon-maskable-512.png")
+          bg = icon.getpixel((2, 2))[:3]
+          hexbg = "#%02X%02X%02X" % bg
+
+          legacy = {"mdpi": 48, "hdpi": 72, "xhdpi": 96, "xxhdpi": 144, "xxxhdpi": 192}
+          for d, px in legacy.items():
+              out = os.path.join(res, "mipmap-" + d)
+              os.makedirs(out, exist_ok=True)
+              sq = icon.resize((px, px), Image.LANCZOS)
+              sq.save(os.path.join(out, "ic_launcher.png"))
+              m = Image.new("L", (px * 4, px * 4), 0)
+              ImageDraw.Draw(m).ellipse((0, 0, px * 4 - 1, px * 4 - 1), fill=255)
+              rd = sq.copy(); rd.putalpha(m.resize((px, px), Image.LANCZOS))
+              rd.save(os.path.join(out, "ic_launcher_round.png"))
+              fg = mask.resize((px * 9 // 4, px * 9 // 4), Image.LANCZOS)      # adaptive icon layer is 108dp = 2.25 x the 48dp icon
+              fg.save(os.path.join(out, "ic_launcher_foreground.png"))
+
+          os.makedirs(os.path.join(res, "values"), exist_ok=True)
+          open(os.path.join(res, "values", "ic_launcher_background.xml"), "w").write(
+              '<?xml version="1.0" encoding="utf-8"?>\n<resources>\n    <color name="ic_launcher_background">' + hexbg + '</color>\n</resources>\n')
+          os.makedirs(os.path.join(res, "mipmap-anydpi-v26"), exist_ok=True)
+          xml = ('<?xml version="1.0" encoding="utf-8"?>\n<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">\n'
+                 '    <background android:drawable="@color/ic_launcher_background"/>\n    <foreground android:drawable="@mipmap/ic_launcher_foreground"/>\n</adaptive-icon>\n')
+          for n in ("ic_launcher.xml", "ic_launcher_round.xml"):
+              open(os.path.join(res, "mipmap-anydpi-v26", n), "w").write(xml)
+          print("ECHO-1 icons written, background", hexbg)
+          EOF
       - name: Build the Android app
         working-directory: app
+        env:
+          ECHO_URL: ${{ inputs.url }}
         run: |
           npm install
           npx cap add android
           node native/patch-android.js
+          pip install --quiet pillow
+          python3 native/make-icons.py "$ECHO_URL" || echo "Icon step skipped, using the default icon"
           npx cap sync android
           cd android
           chmod +x gradlew
