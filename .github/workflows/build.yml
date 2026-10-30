@@ -229,14 +229,18 @@ jobs:
           cat > native/BubbleService.java <<'EOF'
           package com.echo1.app;
 
+          import android.app.AlertDialog;
           import android.app.Notification;
           import android.app.NotificationChannel;
           import android.app.NotificationManager;
           import android.app.PendingIntent;
           import android.app.Service;
           import android.content.Intent;
+          import android.content.SharedPreferences;
           import android.content.pm.ServiceInfo;
+          import android.graphics.Color;
           import android.graphics.PixelFormat;
+          import android.graphics.PorterDuff;
           import android.graphics.drawable.GradientDrawable;
           import android.os.Build;
           import android.os.IBinder;
@@ -245,18 +249,23 @@ jobs:
           import android.view.View;
           import android.view.WindowManager;
           import android.widget.ImageView;
+          import android.widget.Toast;
 
-          /** A small ECHO-1 bubble that floats over other apps. Drag it anywhere. Tap it to ask. */
+          /** ECHO-1 floating companion. Drag to move, tap to chat, long-press to customize. */
           public class BubbleService extends Service {
+              private static final String PREFS = "echo_bubble_prefs";
+              private static final String PX = "x", PY = "y", PS = "size", PC = "accent";
               private WindowManager wm;
-              private View bubble;
+              private ImageView bubble;
+              private WindowManager.LayoutParams lp;
+              private SharedPreferences prefs;
+              private final int[] accents = new int[]{0xFFC8F43A, 0xFFB78CFF, 0xFFFF8FA3, 0xFF65D9FF, 0xFFFFB45E};
+              private final String[] accentNames = new String[]{"Lime", "Violet", "Rose", "Sky blue", "Amber"};
 
               @Override public IBinder onBind(Intent i) { return null; }
-
               private int dp(int v) { return Math.round(v * getResources().getDisplayMetrics().density); }
 
-              @Override
-              public int onStartCommand(Intent intent, int flags, int startId) {
+              @Override public int onStartCommand(Intent intent, int flags, int startId) {
                   if (intent != null && "STOP".equals(intent.getAction())) { stopSelf(); return START_NOT_STICKY; }
                   goForeground();
                   if (bubble == null) addBubble();
@@ -266,17 +275,13 @@ jobs:
               private void goForeground() {
                   String ch = "echo_bubble";
                   NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
-                  if (Build.VERSION.SDK_INT >= 26 && nm.getNotificationChannel(ch) == null) {
+                  if (Build.VERSION.SDK_INT >= 26 && nm.getNotificationChannel(ch) == null)
                       nm.createNotificationChannel(new NotificationChannel(ch, "ECHO-1 bubble", NotificationManager.IMPORTANCE_MIN));
-                  }
                   PendingIntent hide = PendingIntent.getService(this, 1, new Intent(this, BubbleService.class).setAction("STOP"),
                       PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
                   Notification.Builder nb = Build.VERSION.SDK_INT >= 26 ? new Notification.Builder(this, ch) : new Notification.Builder(this);
-                  nb.setContentTitle("ECHO-1 bubble is on")
-                    .setContentText("Tap the bubble to ask. Tap here to hide it.")
-                    .setSmallIcon(android.R.drawable.ic_btn_speak_now)
-                    .setContentIntent(hide)
-                    .setOngoing(true);
+                  nb.setContentTitle("ECHO-1 companion is on").setContentText("Tap to chat · long-press the companion to customize")
+                    .setSmallIcon(android.R.drawable.ic_btn_speak_now).setContentIntent(hide).setOngoing(true);
                   Notification n = nb.build();
                   if (Build.VERSION.SDK_INT >= 34) startForeground(7, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
                   else startForeground(7, n);
@@ -284,60 +289,84 @@ jobs:
 
               private void addBubble() {
                   wm = (WindowManager) getSystemService(WINDOW_SERVICE);
-                  int size = dp(56);
-                  ImageView v = new ImageView(this);
-                  v.setImageResource(R.drawable.echo_widget_icon);
-                  v.setScaleType(ImageView.ScaleType.FIT_CENTER);
-                  v.setPadding(dp(3), dp(3), dp(3), dp(3));
-                  GradientDrawable bg = new GradientDrawable();
-                  bg.setShape(GradientDrawable.OVAL);
-                  bg.setColor(0xFF14101F);
-                  bg.setStroke(dp(2), 0xFFC8F43A);
-                  v.setBackground(bg);
-
-                  final WindowManager.LayoutParams lp = new WindowManager.LayoutParams(size, size,
+                  prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+                  int size = dp(prefs.getInt(PS, 56));
+                  bubble = new ImageView(this);
+                  bubble.setImageResource(R.drawable.echo_widget_icon);
+                  bubble.setScaleType(ImageView.ScaleType.FIT_CENTER);
+                  bubble.setPadding(dp(3), dp(3), dp(3), dp(3));
+                  styleBubble();
+                  lp = new WindowManager.LayoutParams(size, size,
                       Build.VERSION.SDK_INT >= 26 ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY : WindowManager.LayoutParams.TYPE_PHONE,
                       WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
                       PixelFormat.TRANSLUCENT);
                   lp.gravity = Gravity.TOP | Gravity.START;
-                  lp.x = dp(12);
-                  lp.y = dp(240);
-
-                  v.setOnTouchListener(new View.OnTouchListener() {
-                      float downX, downY; int startX, startY; boolean moved;
+                  lp.x = prefs.getInt(PX, dp(12));
+                  lp.y = prefs.getInt(PY, dp(240));
+                  bubble.setOnTouchListener(new View.OnTouchListener() {
+                      float downX, downY; int startX, startY; boolean moved; long downAt;
                       @Override public boolean onTouch(View view, MotionEvent e) {
                           switch (e.getAction()) {
                               case MotionEvent.ACTION_DOWN:
-                                  downX = e.getRawX(); downY = e.getRawY(); startX = lp.x; startY = lp.y; moved = false; return true;
+                                  downX=e.getRawX(); downY=e.getRawY(); startX=lp.x; startY=lp.y; moved=false; downAt=System.currentTimeMillis(); return true;
                               case MotionEvent.ACTION_MOVE:
-                                  if (Math.abs(e.getRawX() - downX) > dp(8) || Math.abs(e.getRawY() - downY) > dp(8)) moved = true;
-                                  if (moved) {
-                                      lp.x = startX + Math.round(e.getRawX() - downX);
-                                      lp.y = startY + Math.round(e.getRawY() - downY);
-                                      try { wm.updateViewLayout(bubble, lp); } catch (Exception ignored) { }
-                                  }
+                                  if (Math.abs(e.getRawX()-downX)>dp(8) || Math.abs(e.getRawY()-downY)>dp(8)) moved=true;
+                                  if (moved) { lp.x=startX+Math.round(e.getRawX()-downX); lp.y=startY+Math.round(e.getRawY()-downY); try { wm.updateViewLayout(bubble,lp); } catch(Exception ignored){} }
                                   return true;
                               case MotionEvent.ACTION_UP:
-                                  if (!moved) {
-                                      try {
-                                          startActivity(new Intent(BubbleService.this, AssistActivity.class)
-                                              .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP));
-                                      } catch (Exception ignored) { }
-                                  }
+                                  if (moved) prefs.edit().putInt(PX,lp.x).putInt(PY,lp.y).apply();
+                                  else if (System.currentTimeMillis()-downAt>=550) showCustomize();
+                                  else openAssistant();
                                   return true;
                           }
                           return false;
                       }
                   });
-                  bubble = v;
-                  try { wm.addView(bubble, lp); } catch (Exception e) { bubble = null; stopSelf(); }
+                  try { wm.addView(bubble,lp); } catch(Exception e) { bubble=null; stopSelf(); }
               }
 
-              @Override
-              public void onDestroy() {
+              private void styleBubble() {
+                  if (bubble == null || prefs == null) return;
+                  int accent = accents[Math.max(0, Math.min(accents.length-1, prefs.getInt(PC,0)))];
+                  GradientDrawable bg = new GradientDrawable(); bg.setShape(GradientDrawable.OVAL);
+                  bg.setColor(0xFF14101F); bg.setStroke(dp(2),accent); bubble.setBackground(bg);
+                  bubble.setColorFilter(accent, PorterDuff.Mode.MULTIPLY);
+              }
+
+              private void openAssistant() {
+                  try { startActivity(new Intent(BubbleService.this, AssistActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP)); }
+                  catch(Exception ignored) { Toast.makeText(this,"Could not open ECHO-1",Toast.LENGTH_SHORT).show(); }
+              }
+
+              private void showCustomize() {
+                  if (isFinishingSafe()) return;
+                  final String[] choices = new String[]{"Small (44 dp)","Medium (56 dp)","Large (68 dp)","Extra large (80 dp)","Change accent colour"};
+                  AlertDialog dialog = new AlertDialog.Builder(this).setTitle("Customize your ECHO-1 companion")
+                    .setItems(choices,(d,which)->{
+                      if (which < 4) {
+                        int[] sizes={44,56,68,80}; int px=dp(sizes[which]);
+                        prefs.edit().putInt(PS,sizes[which]).apply(); lp.width=px; lp.height=px;
+                        try { wm.updateViewLayout(bubble,lp); } catch(Exception ignored){}
+                      } else showAccentPicker();
+                    }).setNegativeButton("Cancel",null).create();
+                  if (dialog.getWindow()!=null && Build.VERSION.SDK_INT>=26) dialog.getWindow().setType(WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY);
+                  dialog.show();
+              }
+
+              private boolean isFinishingSafe() { return bubble == null || !bubble.isAttachedToWindow(); }
+              private void showAccentPicker() {
+                  AlertDialog dialog = new AlertDialog.Builder(this).setTitle("Companion accent colour")
+                    .setSingleChoiceItems(accentNames,prefs.getInt(PC,0),(d,which)->{
+                      prefs.edit().putInt(PC,which).apply(); styleBubble(); d.dismiss();
+                    }).setNegativeButton("Cancel",null).create();
+                  if (dialog.getWindow()!=null && Build.VERSION.SDK_INT>=26) dialog.getWindow().setType(WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY);
+                  dialog.show();
+              }
+
+              @Override public void onDestroy() {
                   super.onDestroy();
-                  try { if (wm != null && bubble != null) wm.removeView(bubble); } catch (Exception ignored) { }
-                  bubble = null;
+                  try { if (wm != null && bubble != null) wm.removeView(bubble); } catch(Exception ignored){}
+                  bubble=null;
               }
           }
           EOF
@@ -359,10 +388,8 @@ jobs:
           import android.graphics.RectF;
           import android.graphics.Typeface;
           import android.graphics.drawable.GradientDrawable;
-          import android.net.Uri;
           import android.os.Build;
           import android.os.Bundle;
-          import android.provider.AlarmClock;
           import android.os.Handler;
           import android.os.Looper;
           import android.speech.RecognitionListener;
@@ -373,18 +400,10 @@ jobs:
           import android.view.ViewGroup;
           import android.view.WindowInsets;
           import android.view.WindowManager;
-          import android.view.animation.DecelerateInterpolator;
           import android.view.inputmethod.EditorInfo;
-          import android.webkit.JavascriptInterface;
-          import android.webkit.WebSettings;
-          import android.webkit.WebView;
-          import android.webkit.WebViewClient;
-          import org.json.JSONArray;
-          import org.json.JSONObject;
           import android.widget.EditText;
           import android.widget.FrameLayout;
           import android.widget.LinearLayout;
-          import android.widget.ScrollView;
           import android.widget.TextView;
           import java.util.ArrayList;
 
@@ -400,14 +419,7 @@ jobs:
               private TextView status;
               private IconView orb;
               private View halo;
-              private LinearLayout card, dotsRow, actionsRow;
-              private ScrollView replyScroll;
-              private TextView replyView, openBtn;
-              private WebView brain;
-              private boolean brainReady = false;
-              private String pendingQ = null, lastQ = "";
-              private Runnable typer, watchdog;
-              private final ArrayList<ObjectAnimator> dotAnims = new ArrayList<>();
+              private LinearLayout card;
               private ObjectAnimator pulse;
               private boolean listening = false;
               private int attempt = 0;   // 0 = Google's speech engine, 1 = the phone's default engine, 2 = the phone's own voice window
@@ -526,57 +538,6 @@ jobs:
                   status.setPadding(0, dp(6), 0, dp(16));
                   card.addView(status);
 
-                  dotsRow = new LinearLayout(this);
-                  dotsRow.setOrientation(LinearLayout.HORIZONTAL);
-                  dotsRow.setVisibility(View.GONE);
-                  for (int k = 0; k < 3; k++) {
-                      View d = new View(this);
-                      d.setBackground(oval(k == 1 ? ACCENT : ACCENT2, 0, 0));
-                      LinearLayout.LayoutParams dl = new LinearLayout.LayoutParams(dp(10), dp(10));
-                      dl.rightMargin = dp(8);
-                      dotsRow.addView(d, dl);
-                  }
-                  LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-                  dlp.bottomMargin = dp(18);
-                  card.addView(dotsRow, dlp);
-
-                  replyView = new TextView(this);
-                  replyView.setTextColor(INK);
-                  replyView.setTextSize(17);
-                  replyView.setLineSpacing(0, 1.25f);
-                  replyView.setTextIsSelectable(true);
-                  replyScroll = new ScrollView(this) {
-                      @Override protected void onMeasure(int w, int hs) {
-                          super.onMeasure(w, View.MeasureSpec.makeMeasureSpec(getResources().getDisplayMetrics().heightPixels * 45 / 100, View.MeasureSpec.AT_MOST));
-                      }
-                  };
-                  replyScroll.setVisibility(View.GONE);
-                  replyScroll.addView(replyView);
-                  LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-                  rlp.bottomMargin = dp(16);
-                  card.addView(replyScroll, rlp);
-
-                  actionsRow = new LinearLayout(this);
-                  actionsRow.setOrientation(LinearLayout.VERTICAL);
-                  actionsRow.setVisibility(View.GONE);
-                  card.addView(actionsRow, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-
-                  openBtn = new TextView(this);
-                  openBtn.setText("Open in ECHO-1");
-                  openBtn.setTextColor(ACCENT);
-                  openBtn.setTextSize(14);
-                  openBtn.setPadding(dp(16), dp(8), dp(16), dp(8));
-                  GradientDrawable ob = new GradientDrawable();
-                  ob.setColor(0);
-                  ob.setStroke(dp(1), ACCENT);
-                  ob.setCornerRadius(dp(18));
-                  openBtn.setBackground(ob);
-                  openBtn.setVisibility(View.GONE);
-                  openBtn.setOnClickListener(v -> openInApp());
-                  LinearLayout.LayoutParams olp2 = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-                  olp2.bottomMargin = dp(14);
-                  card.addView(openBtn, olp2);
-
                   LinearLayout row = new LinearLayout(this);
                   row.setOrientation(LinearLayout.HORIZONTAL);
                   row.setGravity(Gravity.CENTER_VERTICAL);
@@ -620,10 +581,6 @@ jobs:
                   row.addView(send, slp);
 
                   setContentView(root);
-                  setupBrain(root);
-                  card.setTranslationY(dp(320));
-                  card.setAlpha(0f);
-                  card.animate().translationY(0).alpha(1f).setDuration(280).setInterpolator(new DecelerateInterpolator()).start();
                   root.post(this::startListening);
               }
 
@@ -724,256 +681,12 @@ jobs:
               private void submit() {
                   String q = input.getText().toString().trim();
                   if (q.isEmpty()) { setStatus("Say or type something first."); return; }
-                  if (listening) stopListening();
-                  destroyRecognizer();
-                  input.setText("");
-                  ask(q);
-              }
-
-              /** Shows the answer right here on the card. ECHO-1 does not open. */
-              private void ask(String q) {
-                  lastQ = q;
-                  if (typer != null) h.removeCallbacks(typer);
-                  status.setTextSize(15);
-                  status.setTextColor(INK2);
-                  status.setText(q);
-                  replyScroll.setVisibility(View.GONE);
-                  replyView.setText("");
-                  openBtn.setVisibility(View.GONE);
-                  actionsRow.removeAllViews();
-                  actionsRow.setVisibility(View.GONE);
-                  startThinking();
-                  if (watchdog != null) h.removeCallbacks(watchdog);
-                  watchdog = () -> showError("That took too long. Try again.");
-                  h.postDelayed(watchdog, 62000);
-                  if (brain == null) { showError("Couldn't start. Open ECHO-1 once, then try again."); return; }
-                  if (!brainReady) { pendingQ = q; return; }
-                  brain.evaluateJavascript("window.echoAsk(" + JSONObject.quote(q) + ")", null);
-              }
-
-              private void setupBrain(FrameLayout root) {
-                  try {
-                      brain = new WebView(this);
-                      WebSettings s = brain.getSettings();
-                      s.setJavaScriptEnabled(true);
-                      s.setDomStorageEnabled(true);
-                      brain.addJavascriptInterface(new Bridge(), "EchoNative");
-                      brain.setWebViewClient(new WebViewClient());
-                      brain.setVisibility(View.INVISIBLE);
-                      root.addView(brain, new FrameLayout.LayoutParams(dp(1), dp(1)));
-                      brain.loadUrl("__ECHO_URL__/overlay.html");
-                  } catch (Exception e) { brain = null; }
-              }
-
-              private class Bridge {
-                  @JavascriptInterface public void ready() {
-                      h.post(() -> {
-                          brainReady = true;
-                          if (pendingQ != null && brain != null) {
-                              String q = pendingQ; pendingQ = null;
-                              brain.evaluateJavascript("window.echoAsk(" + JSONObject.quote(q) + ")", null);
-                          }
-                      });
-                  }
-                  @JavascriptInterface public void reply(String text, String actionsJson, boolean hasImage) { h.post(() -> showReply(text, actionsJson, hasImage)); }
-                  @JavascriptInterface public void fail(String msg) { h.post(() -> showError(msg)); }
-              }
-
-              private void startThinking() {
-                  stopThinking();
-                  dotsRow.setVisibility(View.VISIBLE);
-                  for (int k = 0; k < dotsRow.getChildCount(); k++) {
-                      ObjectAnimator an = ObjectAnimator.ofFloat(dotsRow.getChildAt(k), "alpha", 0.2f, 1f);
-                      an.setDuration(560);
-                      an.setStartDelay(k * 160L);
-                      an.setRepeatCount(ObjectAnimator.INFINITE);
-                      an.setRepeatMode(ObjectAnimator.REVERSE);
-                      an.start();
-                      dotAnims.add(an);
-                  }
-              }
-
-              private void stopThinking() {
-                  for (ObjectAnimator an : dotAnims) an.cancel();
-                  dotAnims.clear();
-                  if (dotsRow != null) dotsRow.setVisibility(View.GONE);
-              }
-
-              private void showReply(String text, String actionsJson, boolean hasImage) {
-                  if (watchdog != null) h.removeCallbacks(watchdog);
-                  stopThinking();
-                  replyScroll.setVisibility(View.VISIBLE);
-                  replyView.setAlpha(0f);
-                  replyView.animate().alpha(1f).setDuration(200).start();
-                  typeOut(text == null ? "" : text);
-                  actionsRow.removeAllViews();
-                  boolean needsApp = hasImage;
-                  try {
-                      JSONArray arr = new JSONArray(actionsJson == null || actionsJson.isEmpty() ? "[]" : actionsJson);
-                      for (int k = 0; k < arr.length(); k++) {
-                          JSONObject o = arr.getJSONObject(k);
-                          JSONObject a = o.optJSONObject("args");
-                          if (a == null) a = new JSONObject();
-                          if (!doAction(o.optString("name"), a)) needsApp = true;
-                      }
-                  } catch (Exception ignored) { }
-                  actionsRow.setVisibility(actionsRow.getChildCount() > 0 ? View.VISIBLE : View.GONE);
-                  if (needsApp) { openBtn.setText("Finish in ECHO-1"); openBtn.setVisibility(View.VISIBLE); }
-              }
-
-              /** Does what ECHO-1 asked for. Alarms and timers are set right away. Anything that opens another app becomes a button you tap.
-               *  Returns false when only the full ECHO-1 app can do it. */
-              private boolean doAction(String name, JSONObject a) {
-                  try {
-                      switch (name) {
-                          case "set_theme": case "set_chat_theme": case "set_font_size": case "set_mode":
-                          case "remember_fact": case "save_app_shortcut": case "open_sports":
-                              return true;   // nothing to show on the card
-                          case "set_alarm": {
-                              Intent i = new Intent(AlarmClock.ACTION_SET_ALARM)
-                                  .putExtra(AlarmClock.EXTRA_HOUR, Math.max(0, Math.min(23, a.optInt("hour"))))
-                                  .putExtra(AlarmClock.EXTRA_MINUTES, Math.max(0, Math.min(59, a.optInt("minute"))))
-                                  .putExtra(AlarmClock.EXTRA_MESSAGE, a.optString("label", "Alarm"))
-                                  .putExtra(AlarmClock.EXTRA_SKIP_UI, true);
-                              startActivity(i);
-                              return true;
-                          }
-                          case "set_timer": {
-                              int sec = a.optInt("seconds");
-                              if (sec <= 0) return false;
-                              Intent i = new Intent(AlarmClock.ACTION_SET_TIMER)
-                                  .putExtra(AlarmClock.EXTRA_LENGTH, sec)
-                                  .putExtra(AlarmClock.EXTRA_MESSAGE, a.optString("label", "Timer"))
-                                  .putExtra(AlarmClock.EXTRA_SKIP_UI, true);
-                              startActivity(i);
-                              return true;
-                          }
-                          case "open_maps": {
-                              String q = Uri.encode(a.optString("query"));
-                              boolean dir = a.optBoolean("directions");
-                              String mode = a.optString("travel_mode", "");
-                              String url = dir ? "https://www.google.com/maps/dir/?api=1&destination=" + q + (mode.isEmpty() ? "" : "&travelmode=" + mode)
-                                               : "https://www.google.com/maps/search/?api=1&query=" + q;
-                              addAction(dir ? "Get directions" : "Open in Maps", new Intent(Intent.ACTION_VIEW, Uri.parse(url)));
-                              return true;
-                          }
-                          case "open_youtube":
-                              addAction("Open YouTube", new Intent(Intent.ACTION_VIEW, Uri.parse("https://www.youtube.com/results?search_query=" + Uri.encode(a.optString("query")))));
-                              return true;
-                          case "open_google":
-                              addAction("Search Google", new Intent(Intent.ACTION_VIEW, Uri.parse("https://www.google.com/search?q=" + Uri.encode(a.optString("query")))));
-                              return true;
-                          case "call_phone": {
-                              String num = a.optString("number", "").replaceAll("[^0-9+]", "");
-                              addAction("Call " + a.optString("name", ""), new Intent(Intent.ACTION_DIAL, Uri.parse("tel:" + num)));
-                              return true;
-                          }
-                          case "send_sms": {
-                              String num = a.optString("number", "").replaceAll("[^0-9+]", "");
-                              addAction("Text " + a.optString("name", ""), new Intent(Intent.ACTION_SENDTO, Uri.parse("smsto:" + num)).putExtra("sms_body", a.optString("message")));
-                              return true;
-                          }
-                          case "send_whatsapp": {
-                              String num = a.optString("number", "").replaceAll("[^0-9]", "");
-                              addAction("WhatsApp " + a.optString("name", ""), new Intent(Intent.ACTION_VIEW, Uri.parse("https://wa.me/" + num + "?text=" + Uri.encode(a.optString("message")))));
-                              return true;
-                          }
-                          case "compose_email": {
-                              Intent i = new Intent(Intent.ACTION_SENDTO, Uri.parse("mailto:" + a.optString("to", "")))
-                                  .putExtra(Intent.EXTRA_SUBJECT, a.optString("subject")).putExtra(Intent.EXTRA_TEXT, a.optString("body"));
-                              addAction("Open email draft", i);
-                              return true;
-                          }
-                          case "open_store": {
-                              String pkg = a.optString("android_package", "");
-                              String uri = pkg.matches("^[A-Za-z][A-Za-z0-9_]*(\\.[A-Za-z][A-Za-z0-9_]*)+$") ? "market://details?id=" + pkg
-                                         : "market://search?q=" + Uri.encode(a.optString("name")) + "&c=apps";
-                              addAction("Open Google Play", new Intent(Intent.ACTION_VIEW, Uri.parse(uri)));
-                              return true;
-                          }
-                          case "open_app": {
-                              String key = a.optString("app");
-                              String[][] apps = {
-                                  { "whatsapp", "com.whatsapp", "WhatsApp" }, { "instagram", "com.instagram.android", "Instagram" },
-                                  { "telegram", "org.telegram.messenger", "Telegram" }, { "spotify", "com.spotify.music", "Spotify" },
-                                  { "youtube", "com.google.android.youtube", "YouTube" }, { "gmail", "com.google.android.gm", "Email" },
-                                  { "calendar", "com.google.android.calendar", "Calendar" }, { "maps", "com.google.android.apps.maps", "Maps" },
-                                  { "googlewallet", "com.google.android.apps.walletnfcrel", "Google Wallet" }, { "gpay", "com.google.android.apps.nbu.paisa.user", "Google Pay" },
-                                  { "paypal", "com.paypal.android.p2pmobile", "PayPal" }, { "venmo", "com.venmo", "Venmo" },
-                                  { "cashapp", "com.squareup.cash", "Cash App" }, { "esewa", "com.f1soft.esewa", "eSewa" }, { "khalti", "com.khalti", "Khalti" }
-                              };
-                              if (key.equals("phone")) { addAction("Open Phone", new Intent(Intent.ACTION_DIAL)); return true; }
-                              if (key.equals("messages")) { addAction("Open Messages", Intent.makeMainSelectorActivity(Intent.ACTION_MAIN, Intent.CATEGORY_APP_MESSAGING)); return true; }
-                              for (String[] p : apps) {
-                                  if (!p[0].equals(key)) continue;
-                                  Intent i = getPackageManager().getLaunchIntentForPackage(p[1]);
-                                  if (i == null) i = new Intent(Intent.ACTION_VIEW, Uri.parse("market://details?id=" + p[1]));
-                                  addAction("Open " + p[2], i);
-                                  return true;
-                              }
-                              return false;
-                          }
-                          default:
-                              return false;   // notes, to-dos, reminders, habits, music, weather, documents, mini apps...
-                      }
-                  } catch (Exception e) { return false; }
-              }
-
-              private void addAction(String label, final Intent i) {
-                  TextView b = new TextView(this);
-                  b.setText(label.trim());
-                  b.setTextColor(ON_ACCENT);
-                  b.setTextSize(15);
-                  b.setGravity(Gravity.CENTER);
-                  b.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
-                  GradientDrawable g = new GradientDrawable();
-                  g.setColor(ACCENT);
-                  g.setCornerRadius(dp(24));
-                  b.setBackground(g);
-                  b.setOnClickListener(v -> {
-                      try { startActivity(i); finish(); }
-                      catch (Exception e) { replyView.setText(replyView.getText() + "\n\nCouldn't open that on this phone."); }
-                  });
-                  LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(46));
-                  lp.bottomMargin = dp(10);
-                  actionsRow.addView(b, lp);
-              }
-
-              private void showError(String msg) {
-                  if (watchdog != null) h.removeCallbacks(watchdog);
-                  stopThinking();
-                  replyScroll.setVisibility(View.VISIBLE);
-                  replyView.setAlpha(1f);
-                  replyView.setText(msg);
-                  openBtn.setText("Open in ECHO-1");
-                  openBtn.setVisibility(View.VISIBLE);
-              }
-
-              /** Letters appear a few at a time, like Gemini. */
-              private void typeOut(final String full) {
-                  if (typer != null) h.removeCallbacks(typer);
-                  final int[] n = { 0 };
-                  final int step = Math.max(2, full.length() / 90);
-                  typer = new Runnable() {
-                      @Override public void run() {
-                          n[0] = Math.min(full.length(), n[0] + step);
-                          if (n[0] > 0 && n[0] < full.length() && Character.isHighSurrogate(full.charAt(n[0] - 1))) n[0]++;
-                          replyView.setText(full.substring(0, n[0]));
-                          replyScroll.post(() -> replyScroll.scrollTo(0, replyView.getBottom()));
-                          if (n[0] < full.length()) h.postDelayed(this, 16);
-                      }
-                  };
-                  h.post(typer);
-              }
-
-              private void openInApp() {
                   Intent i = new Intent(this, MainActivity.class)
-                      .putExtra("echo_query", lastQ)
+                      .putExtra("echo_query", q)
                       .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
                   startActivity(i);
                   finish();
               }
-
 
               @Override
               public void onRequestPermissionsResult(int code, String[] perms, int[] results) {
@@ -1034,8 +747,6 @@ jobs:
                   super.onDestroy();
                   h.removeCallbacksAndMessages(null);
                   if (pulse != null) pulse.cancel();
-                  stopThinking();
-                  if (brain != null) { try { brain.destroy(); } catch (Exception ignored) { } }
                   destroyRecognizer();
               }
           }
@@ -1136,7 +847,6 @@ jobs:
           fs.mkdirSync(pkgDir, { recursive: true });
           ["AlarmPlugin", "LauncherPlugin", "AssistPlugin", "AssistActivity", "EchoAssistService", "EchoSessionService", "EchoSession", "EchoRecognitionService", "EchoWidget", "BubbleService"]
             .forEach((f) => fs.copyFileSync(path.join(__dirname, f + ".java"), path.join(pkgDir, f + ".java")));
-          { const aa = path.join(pkgDir, "AssistActivity.java"); fs.writeFileSync(aa, fs.readFileSync(aa, "utf8").replace("__ECHO_URL__", (process.env.ECHO_URL || "https://echo-1-nu.vercel.app").replace(/\/$/, ""))); }
           fs.writeFileSync(path.join(pkgDir, "MainActivity.java"), `package com.echo1.app;
 
           import android.content.Intent;
@@ -1257,6 +967,9 @@ jobs:
                   </service>
                   <activity android:name=".AssistActivity" android:theme="@style/EchoBubble" android:exported="true" android:excludeFromRecents="true"
                       android:launchMode="singleTask" android:taskAffinity="" android:windowSoftInputMode="adjustResize" />
+                  <activity-alias android:name=".AssistLauncher" android:targetActivity=".AssistActivity" android:label="ECHO Ask" android:icon="@mipmap/ic_launcher" android:exported="true">
+                      <intent-filter><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent-filter>
+                  </activity-alias>
                   <receiver android:name=".EchoWidget" android:exported="true">
                       <intent-filter><action android:name="android.appwidget.action.APPWIDGET_UPDATE" /></intent-filter>
                       <meta-data android:name="android.appwidget.provider" android:resource="@xml/echo_widget_info" />
