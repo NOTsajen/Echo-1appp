@@ -226,85 +226,6 @@ jobs:
                   } catch (Exception e) { call.reject("Could not start the bubble"); }
               }
 
-              // ---- spoken replies for the main app (the web view's own speech is silent on Android) ----
-              private android.speech.tts.TextToSpeech tts;
-              private boolean ttsReady = false;
-              private String[] ttsJob = null;          // text, language, id
-              private float ttsRate = 1f, ttsPitch = 1f;
-
-              private void ttsEvent(String name, String id) {
-                  JSObject r = new JSObject();
-                  r.put("id", id);
-                  notifyListeners(name, r);
-              }
-
-              @PluginMethod
-              public void speak(final PluginCall call) {
-                  String text = call.getString("text", "");
-                  String lang = call.getString("lang", "en-US");
-                  String id = call.getString("id", "echo");
-                  Float rt = call.getFloat("rate", 1f), pt = call.getFloat("pitch", 1f);
-                  if (text == null || text.trim().isEmpty()) { call.reject("nothing to say"); return; }
-                  ttsRate = rt == null ? 1f : Math.max(0.5f, Math.min(2f, rt));
-                  ttsPitch = pt == null ? 1f : Math.max(0.5f, Math.min(2f, pt));
-                  ttsJob = new String[] { text.length() > 1500 ? text.substring(0, 1500) : text, lang == null ? "en-US" : lang, id == null ? "echo" : id };
-                  call.resolve();
-                  new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() { @Override public void run() { ttsStartJob(); } });
-              }
-
-              private void ttsStartJob() {
-                  if (tts == null) {
-                      tts = new android.speech.tts.TextToSpeech(getContext().getApplicationContext(), new android.speech.tts.TextToSpeech.OnInitListener() {
-                          @Override public void onInit(int status) {
-                              ttsReady = (status == android.speech.tts.TextToSpeech.SUCCESS);
-                              if (ttsReady) {
-                                  tts.setOnUtteranceProgressListener(new android.speech.tts.UtteranceProgressListener() {
-                                      @Override public void onStart(String id) { ttsEvent("ttsStart", id); }
-                                      @Override public void onDone(String id) { ttsEvent("ttsDone", id); }
-                                      @Override public void onError(String id) { ttsEvent("ttsDone", id); }
-                                  });
-                                  ttsPlayJob();
-                              } else {
-                                  String[] j = ttsJob; ttsJob = null; tts = null;
-                                  if (j != null) ttsEvent("ttsDone", j[2]);
-                              }
-                          }
-                      });
-                      return;
-                  }
-                  if (ttsReady) ttsPlayJob();
-              }
-
-              private void ttsPlayJob() {
-                  String[] j = ttsJob;
-                  if (j == null || tts == null || !ttsReady) return;
-                  ttsJob = null;
-                  try {
-                      String[] p = j[1].split("-");
-                      java.util.Locale loc = p.length > 1 ? new java.util.Locale(p[0], p[1]) : new java.util.Locale(p[0]);
-                      if (tts.isLanguageAvailable(loc) >= android.speech.tts.TextToSpeech.LANG_AVAILABLE) tts.setLanguage(loc);
-                      tts.setSpeechRate(ttsRate);
-                      tts.setPitch(ttsPitch);
-                      tts.speak(j[0], android.speech.tts.TextToSpeech.QUEUE_FLUSH, null, j[2]);
-                  } catch (Exception e) { ttsEvent("ttsDone", j[2]); }
-              }
-
-              @PluginMethod
-              public void stopSpeak(final PluginCall call) {
-                  ttsJob = null;
-                  new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() {
-                      @Override public void run() { try { if (tts != null) tts.stop(); } catch (Exception ignored) { } }
-                  });
-                  call.resolve();
-              }
-
-              @Override
-              protected void handleOnDestroy() {
-                  try { if (tts != null) tts.shutdown(); } catch (Exception ignored) { }
-                  tts = null;
-                  super.handleOnDestroy();
-              }
-
               @PluginMethod
               public void hideBubble(PluginCall call) {
                   try { getContext().stopService(new Intent(getContext(), BubbleService.class)); } catch (Exception ignored) { }
@@ -713,7 +634,7 @@ jobs:
            * This class only gives the page what a web page cannot do: listen with the microphone, open apps, set alarms.
            */
           public class AssistActivity extends Activity implements RecognitionListener {
-              private static final int REQ_MIC = 7, REQ_DIALOG = 8;
+              private static final int REQ_MIC = 7, REQ_DIALOG = 8, REQ_SCREEN = 9;
 
               private WebView web;
               private SpeechRecognizer rec;
@@ -725,6 +646,8 @@ jobs:
               private TextToSpeech tts;
               private String pendingSpeech = null, pendingLang = "en-US";
               private float pendingRate = 1f;
+              private volatile boolean ready = false;
+              private final Runnable watch = new Runnable() { @Override public void run() { if (listening && !ready) { listening = false; nextEngine(); } } };   // an engine that never says ready is silent: try the next one
               private int attempt = 0;   // 0 = Google's speech engine, 1 = the phone's default engine, 2 = the phone's own voice window
               private String lang = "en-US";
               private final Handler h = new Handler(Looper.getMainLooper());
@@ -1007,6 +930,41 @@ jobs:
 
                   @JavascriptInterface public void react(String text) { BubbleService.react(text, false); }
 
+                          @JavascriptInterface public boolean screenActive() { return ScreenService.active; }
+                  
+                          @JavascriptInterface public void screenStart() {
+                              h.post(new Runnable() { @Override public void run() {
+                                  if (!trusted()) return;
+                                  if (ScreenService.active) { event("screenOn", null); return; }
+                                  try {
+                                      android.media.projection.MediaProjectionManager m = (android.media.projection.MediaProjectionManager) getSystemService(Context.MEDIA_PROJECTION_SERVICE);
+                                      startActivityForResult(m.createScreenCaptureIntent(), REQ_SCREEN);
+                                  } catch (Exception e) { event("screenErr", "This phone can't share its screen with ECHO-1."); }
+                              } });
+                          }
+                  
+                          @JavascriptInterface public void screenStop() {
+                              h.post(new Runnable() { @Override public void run() { try { startService(new Intent(AssistActivity.this, ScreenService.class).setAction("stop")); } catch (Exception ignored) { } } });
+                          }
+                  
+                          /** Takes one picture of the screen (the panel hides for a moment so it isn't in the picture) and sends it to the page. */
+                          @JavascriptInterface public void screenshot() {
+                              h.post(new Runnable() { @Override public void run() {
+                                  if (!trusted()) return;
+                                  if (!ScreenService.active) { js("window.__echoShot&&window.__echoShot('')"); return; }
+                                  rootView.setVisibility(View.INVISIBLE);
+                                  h.postDelayed(new Runnable() { @Override public void run() {
+                                      new Thread(new Runnable() { @Override public void run() {
+                                          final String b = ScreenService.grab();
+                                          h.post(new Runnable() { @Override public void run() {
+                                              rootView.setVisibility(View.VISIBLE);
+                                              js("window.__echoShot&&window.__echoShot('" + (b == null ? "" : b) + "')");
+                                          } });
+                                      } }).start();
+                                  } }, 350);
+                              } });
+                          }
+                  
                   @JavascriptInterface public void close() {
                       h.post(new Runnable() { @Override public void run() { finish(); } });
                   }
@@ -1076,6 +1034,8 @@ jobs:
                       listening = true;
                       BubbleService.state("listening");
                       event("listening", null);
+                      ready = false;
+                      h.removeCallbacks(watch); h.postDelayed(watch, 3500);
                       rec.startListening(i);
                   } catch (Exception e) {
                       listening = false;
@@ -1105,6 +1065,7 @@ jobs:
               }
 
               private void nextEngine() {
+                  h.removeCallbacks(watch);
                   attempt++;
                   destroyRecognizer();
                   if (attempt >= 2) { openVoiceWindow(); return; }
@@ -1125,6 +1086,7 @@ jobs:
               }
 
               private void stopListening() {
+                  h.removeCallbacks(watch);
                   boolean was = listening;
                   listening = false;
                   try { if (rec != null) rec.stopListening(); } catch (Exception ignored) { }
@@ -1141,6 +1103,22 @@ jobs:
               @Override
               protected void onActivityResult(int code, int result, Intent data) {
                   super.onActivityResult(code, result, data);
+                      if (code == REQ_SCREEN) {
+                          if (result == RESULT_OK && data != null) {
+                              try {
+                                  Intent si = new Intent(this, ScreenService.class).putExtra("code", result).putExtra("data", data);
+                                  if (android.os.Build.VERSION.SDK_INT >= 26) startForegroundService(si); else startService(si);
+                                  final int[] tries = { 0 };
+                                  h.postDelayed(new Runnable() { @Override public void run() {
+                                      if (ScreenService.active) event("screenOn", null);
+                                      else if (++tries[0] < 12) h.postDelayed(this, 250);
+                                      else event("screenErr", "Screen sharing didn't start. Try again.");
+                                  } }, 250);
+                              } catch (Exception e) { event("screenErr", "Screen sharing didn't start. Try again."); }
+                          } else event("screenErr", "Screen sharing was not allowed.");
+                          return;
+                      }
+                      if (code != REQ_DIALOG) return;
                   if (code != REQ_DIALOG) return;
                   ArrayList<String> list = (result == RESULT_OK && data != null) ? data.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS) : null;
                   if (list != null && !list.isEmpty()) event("final", list.get(0));
@@ -1149,6 +1127,7 @@ jobs:
 
               @Override
               public void onResults(Bundle results) {
+                  h.removeCallbacks(watch);
                   listening = false;
                   BubbleService.state("idle");
                   ArrayList<String> list = results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
@@ -1164,6 +1143,7 @@ jobs:
 
               @Override
               public void onError(int error) {
+                  h.removeCallbacks(watch);
                   listening = false;
                   BubbleService.state("idle");
                   if (error == SpeechRecognizer.ERROR_NO_MATCH || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT) { event("stopped", null); return; }
@@ -1173,8 +1153,8 @@ jobs:
                   nextEngine();   // engine problems (codes 4, 5, 8, 10, 11, 12, 13 ...): switch engine instead of giving up
               }
 
-              @Override public void onReadyForSpeech(Bundle p) { }
-              @Override public void onBeginningOfSpeech() { }
+              @Override public void onReadyForSpeech(Bundle p) { ready = true; h.removeCallbacks(watch); }
+              @Override public void onBeginningOfSpeech() { ready = true; h.removeCallbacks(watch); }
               @Override public void onRmsChanged(float rms) { }
               @Override public void onBufferReceived(byte[] buf) { }
               @Override public void onEndOfSpeech() { }
@@ -1335,6 +1315,130 @@ jobs:
               }
           }
           EOF
+          cat > native/ScreenService.java <<'EOF'
+          package com.echo1.app;
+
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.app.Service;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.pm.ServiceInfo;
+          import android.graphics.Bitmap;
+          import android.graphics.PixelFormat;
+          import android.hardware.display.DisplayManager;
+          import android.hardware.display.VirtualDisplay;
+          import android.media.Image;
+          import android.media.ImageReader;
+          import android.media.projection.MediaProjection;
+          import android.media.projection.MediaProjectionManager;
+          import android.os.Handler;
+          import android.os.HandlerThread;
+          import android.os.IBinder;
+          import android.util.Base64;
+          import android.util.DisplayMetrics;
+          import java.io.ByteArrayOutputStream;
+          import java.nio.ByteBuffer;
+
+          /** Lets ECHO-1 see your screen, only after you allow it. Holds the screen-capture permission and hands out one small JPEG when asked. */
+          public class ScreenService extends Service {
+              static volatile boolean active = false;
+              private static volatile ScreenService inst;
+              private MediaProjection mp;
+              private VirtualDisplay vd;
+              private ImageReader ir;
+              private HandlerThread ht;
+              private int w, h;
+              private volatile Bitmap last;
+              private volatile boolean want = false;
+              private volatile long lastConv = 0;
+              private final Object lock = new Object();
+
+              @Override public IBinder onBind(Intent i) { return null; }
+
+              @Override
+              public int onStartCommand(Intent in, int flags, int id) {
+                  if (in != null && "stop".equals(in.getAction())) { shutdown(); return START_NOT_STICKY; }
+                  try {
+                      NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+                      String ch = "echo_screen";
+                      if (android.os.Build.VERSION.SDK_INT >= 26 && nm.getNotificationChannel(ch) == null)
+                          nm.createNotificationChannel(new NotificationChannel(ch, "ECHO-1 screen sharing", NotificationManager.IMPORTANCE_LOW));
+                      PendingIntent stop = PendingIntent.getService(this, 3, new Intent(this, ScreenService.class).setAction("stop"), PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+                      Notification.Builder nb = android.os.Build.VERSION.SDK_INT >= 26 ? new Notification.Builder(this, ch) : new Notification.Builder(this);
+                      nb.setSmallIcon(android.R.drawable.ic_menu_view).setContentTitle("ECHO-1 can see your screen").setContentText("Tap to stop sharing").setContentIntent(stop).setOngoing(true);
+                      Notification n = nb.build();
+                      if (android.os.Build.VERSION.SDK_INT >= 29) startForeground(9, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION);
+                      else startForeground(9, n);
+                      int code = in == null ? 0 : in.getIntExtra("code", 0);
+                      Intent data = in == null ? null : (Intent) in.getParcelableExtra("data");
+                      if (data == null) { shutdown(); return START_NOT_STICKY; }
+                      MediaProjectionManager m = (MediaProjectionManager) getSystemService(Context.MEDIA_PROJECTION_SERVICE);
+                      mp = m.getMediaProjection(code, data);
+                      ht = new HandlerThread("echo-screen"); ht.start();
+                      Handler bg = new Handler(ht.getLooper());
+                      mp.registerCallback(new MediaProjection.Callback() { @Override public void onStop() { shutdown(); } }, bg);
+                      DisplayMetrics dm = getResources().getDisplayMetrics();
+                      float sc = Math.min(1f, 960f / Math.max(dm.widthPixels, dm.heightPixels));
+                      w = Math.max(2, Math.round(dm.widthPixels * sc)); h = Math.max(2, Math.round(dm.heightPixels * sc));
+                      ir = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2);
+                      ir.setOnImageAvailableListener(new ImageReader.OnImageAvailableListener() {
+                          @Override public void onImageAvailable(ImageReader r) {
+                              Image im = null;
+                              try {
+                                  im = r.acquireLatestImage();
+                                  if (im == null) return;
+                                  long now = System.currentTimeMillis();
+                                  if (!want && now - lastConv < 1500) return;   // while nobody asks, keep the work tiny
+                                  Image.Plane p = im.getPlanes()[0];
+                                  ByteBuffer buf = p.getBuffer();
+                                  int ps = p.getPixelStride(), rs = p.getRowStride();
+                                  Bitmap full = Bitmap.createBitmap(rs / ps, h, Bitmap.Config.ARGB_8888);
+                                  full.copyPixelsFromBuffer(buf);
+                                  Bitmap b = full.getWidth() == w ? full : Bitmap.createBitmap(full, 0, 0, w, h);
+                                  last = b; lastConv = now;
+                                  if (want) { want = false; synchronized (lock) { lock.notifyAll(); } }
+                              } catch (Exception ignored) {
+                              } finally { if (im != null) im.close(); }
+                          }
+                      }, bg);
+                      vd = mp.createVirtualDisplay("echo-screen", w, h, dm.densityDpi, DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, ir.getSurface(), null, bg);
+                      inst = this; active = true;
+                  } catch (Exception e) { shutdown(); }
+                  return START_NOT_STICKY;
+              }
+
+              /** One JPEG of the screen as base64, or null. Waits briefly for a fresh frame. */
+              static String grab() {
+                  ScreenService s = inst;
+                  if (s == null || !active) return null;
+                  try {
+                      synchronized (s.lock) { s.want = true; s.lock.wait(1400); }
+                      s.want = false;
+                      Bitmap b = s.last;
+                      if (b == null) return null;
+                      ByteArrayOutputStream o = new ByteArrayOutputStream();
+                      b.compress(Bitmap.CompressFormat.JPEG, 70, o);
+                      return Base64.encodeToString(o.toByteArray(), Base64.NO_WRAP);
+                  } catch (Exception e) { return null; }
+              }
+
+              private void shutdown() {
+                  active = false; inst = null;
+                  try { if (vd != null) vd.release(); } catch (Exception ignored) { }
+                  try { if (ir != null) ir.close(); } catch (Exception ignored) { }
+                  try { if (mp != null) mp.stop(); } catch (Exception ignored) { }
+                  try { if (ht != null) ht.quitSafely(); } catch (Exception ignored) { }
+                  vd = null; ir = null; mp = null; ht = null; last = null;
+                  try { stopForeground(true); } catch (Exception ignored) { }
+                  stopSelf();
+              }
+
+              @Override public void onDestroy() { active = false; inst = null; super.onDestroy(); }
+          }
+          EOF
           cat > native/patch-android.js <<'EOF'
           // Run after `cap add android`. Copies the native plugins in, registers them, adds the assistant bubble, and adds the permissions ECHO-1 needs. Safe to run again.
           const fs = require("fs"), path = require("path");
@@ -1342,7 +1446,7 @@ jobs:
           const pkgDir = path.join(root, "java", "com", "echo1", "app");
           if (!fs.existsSync(root)) { console.error("Run `npx cap add android` first."); process.exit(1); }
           fs.mkdirSync(pkgDir, { recursive: true });
-          ["AlarmPlugin", "LauncherPlugin", "AssistPlugin", "AssistActivity", "EchoAssistService", "EchoSessionService", "EchoSession", "EchoRecognitionService", "EchoWidget", "EchoBarWidget", "BubbleService"]
+          ["AlarmPlugin", "LauncherPlugin", "AssistPlugin", "AssistActivity", "EchoAssistService", "EchoSessionService", "EchoSession", "EchoRecognitionService", "EchoWidget", "EchoBarWidget", "BubbleService", "ScreenService"]
             .forEach((f) => fs.copyFileSync(path.join(__dirname, f + ".java"), path.join(pkgDir, f + ".java")));
           fs.writeFileSync(path.join(pkgDir, "MainActivity.java"), `package com.echo1.app;
 
@@ -1500,7 +1604,7 @@ jobs:
           ["android.permission.INTERNET", "android.permission.RECORD_AUDIO", "android.permission.MODIFY_AUDIO_SETTINGS",
            "android.permission.ACCESS_FINE_LOCATION", "android.permission.ACCESS_COARSE_LOCATION",
            "android.permission.POST_NOTIFICATIONS", "android.permission.VIBRATE", "com.android.alarm.permission.SET_ALARM",
-           "android.permission.SYSTEM_ALERT_WINDOW", "android.permission.FOREGROUND_SERVICE", "android.permission.FOREGROUND_SERVICE_SPECIAL_USE"
+           "android.permission.SYSTEM_ALERT_WINDOW", "android.permission.FOREGROUND_SERVICE", "android.permission.FOREGROUND_SERVICE_SPECIAL_USE", "android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION"
           ].forEach((p) => { if (!x.includes('"' + p + '"')) x = x.replace("</manifest>", '    <uses-permission android:name="' + p + '" />\n</manifest>'); });
           // Lets the app see and open other installed apps, and find the speech engine (Android 11+ hides them otherwise).
           if (!x.includes("<queries>")) x = x.replace("<application", '<queries>\n        <intent><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent>\n        <intent><action android:name="android.intent.action.VIEW" /><data android:scheme="https" /></intent>\n        <intent><action android:name="android.speech.RecognitionService" /></intent>\n    </queries>\n\n    <application');
@@ -1536,6 +1640,12 @@ jobs:
                       <intent-filter><action android:name="android.appwidget.action.APPWIDGET_UPDATE" /></intent-filter>
                       <meta-data android:name="android.appwidget.provider" android:resource="@xml/echo_bar_widget_info" />
                   </receiver>
+              </application>`);
+          }
+          // Screen sharing (only after you allow it): lets the bubble panel see the screen.
+          if (!x.includes(".ScreenService")) {
+            x = x.replace("</application>", `
+                  <service android:name=".ScreenService" android:exported="false" android:foregroundServiceType="mediaProjection" />
               </application>`);
           }
           fs.writeFileSync(mf, x);
