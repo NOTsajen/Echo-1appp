@@ -226,6 +226,85 @@ jobs:
                   } catch (Exception e) { call.reject("Could not start the bubble"); }
               }
 
+              // ---- spoken replies for the main app (the web view's own speech is silent on Android) ----
+              private android.speech.tts.TextToSpeech tts;
+              private boolean ttsReady = false;
+              private String[] ttsJob = null;          // text, language, id
+              private float ttsRate = 1f, ttsPitch = 1f;
+
+              private void ttsEvent(String name, String id) {
+                  JSObject r = new JSObject();
+                  r.put("id", id);
+                  notifyListeners(name, r);
+              }
+
+              @PluginMethod
+              public void speak(final PluginCall call) {
+                  String text = call.getString("text", "");
+                  String lang = call.getString("lang", "en-US");
+                  String id = call.getString("id", "echo");
+                  Float rt = call.getFloat("rate", 1f), pt = call.getFloat("pitch", 1f);
+                  if (text == null || text.trim().isEmpty()) { call.reject("nothing to say"); return; }
+                  ttsRate = rt == null ? 1f : Math.max(0.5f, Math.min(2f, rt));
+                  ttsPitch = pt == null ? 1f : Math.max(0.5f, Math.min(2f, pt));
+                  ttsJob = new String[] { text.length() > 1500 ? text.substring(0, 1500) : text, lang == null ? "en-US" : lang, id == null ? "echo" : id };
+                  call.resolve();
+                  new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() { @Override public void run() { ttsStartJob(); } });
+              }
+
+              private void ttsStartJob() {
+                  if (tts == null) {
+                      tts = new android.speech.tts.TextToSpeech(getContext().getApplicationContext(), new android.speech.tts.TextToSpeech.OnInitListener() {
+                          @Override public void onInit(int status) {
+                              ttsReady = (status == android.speech.tts.TextToSpeech.SUCCESS);
+                              if (ttsReady) {
+                                  tts.setOnUtteranceProgressListener(new android.speech.tts.UtteranceProgressListener() {
+                                      @Override public void onStart(String id) { ttsEvent("ttsStart", id); }
+                                      @Override public void onDone(String id) { ttsEvent("ttsDone", id); }
+                                      @Override public void onError(String id) { ttsEvent("ttsDone", id); }
+                                  });
+                                  ttsPlayJob();
+                              } else {
+                                  String[] j = ttsJob; ttsJob = null; tts = null;
+                                  if (j != null) ttsEvent("ttsDone", j[2]);
+                              }
+                          }
+                      });
+                      return;
+                  }
+                  if (ttsReady) ttsPlayJob();
+              }
+
+              private void ttsPlayJob() {
+                  String[] j = ttsJob;
+                  if (j == null || tts == null || !ttsReady) return;
+                  ttsJob = null;
+                  try {
+                      String[] p = j[1].split("-");
+                      java.util.Locale loc = p.length > 1 ? new java.util.Locale(p[0], p[1]) : new java.util.Locale(p[0]);
+                      if (tts.isLanguageAvailable(loc) >= android.speech.tts.TextToSpeech.LANG_AVAILABLE) tts.setLanguage(loc);
+                      tts.setSpeechRate(ttsRate);
+                      tts.setPitch(ttsPitch);
+                      tts.speak(j[0], android.speech.tts.TextToSpeech.QUEUE_FLUSH, null, j[2]);
+                  } catch (Exception e) { ttsEvent("ttsDone", j[2]); }
+              }
+
+              @PluginMethod
+              public void stopSpeak(final PluginCall call) {
+                  ttsJob = null;
+                  new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() {
+                      @Override public void run() { try { if (tts != null) tts.stop(); } catch (Exception ignored) { } }
+                  });
+                  call.resolve();
+              }
+
+              @Override
+              protected void handleOnDestroy() {
+                  try { if (tts != null) tts.shutdown(); } catch (Exception ignored) { }
+                  tts = null;
+                  super.handleOnDestroy();
+              }
+
               @PluginMethod
               public void hideBubble(PluginCall call) {
                   try { getContext().stopService(new Intent(getContext(), BubbleService.class)); } catch (Exception ignored) { }
