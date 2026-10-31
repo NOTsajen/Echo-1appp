@@ -330,7 +330,7 @@ jobs:
                   int accent = accents[Math.max(0, Math.min(accents.length-1, prefs.getInt(PC,0)))];
                   GradientDrawable bg = new GradientDrawable(); bg.setShape(GradientDrawable.OVAL);
                   bg.setColor(0xFF14101F); bg.setStroke(dp(2),accent); bubble.setBackground(bg);
-                  bubble.setColorFilter(accent, PorterDuff.Mode.MULTIPLY);
+                  bubble.clearColorFilter();   // keep the chibi companion in full colour; the accent only tints the ring
               }
 
               private void openAssistant() {
@@ -967,9 +967,6 @@ jobs:
                   </service>
                   <activity android:name=".AssistActivity" android:theme="@style/EchoBubble" android:exported="true" android:excludeFromRecents="true"
                       android:launchMode="singleTask" android:taskAffinity="" android:windowSoftInputMode="adjustResize" />
-                  <activity-alias android:name=".AssistLauncher" android:targetActivity=".AssistActivity" android:label="ECHO Ask" android:icon="@mipmap/ic_launcher" android:exported="true">
-                      <intent-filter><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent-filter>
-                  </activity-alias>
                   <receiver android:name=".EchoWidget" android:exported="true">
                       <intent-filter><action android:name="android.appwidget.action.APPWIDGET_UPDATE" /></intent-filter>
                       <meta-data android:name="android.appwidget.provider" android:resource="@xml/echo_widget_info" />
