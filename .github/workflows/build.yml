@@ -213,7 +213,14 @@ jobs:
               public void showBubble(PluginCall call) {
                   if (Build.VERSION.SDK_INT >= 23 && !Settings.canDrawOverlays(getContext())) { call.reject("Overlay permission is off"); return; }
                   try {
+                      android.content.SharedPreferences bp = getContext().getSharedPreferences("echo_bubble_prefs", android.content.Context.MODE_PRIVATE);
+                      boolean auto = Boolean.TRUE.equals(call.getBoolean("auto", false));
+                      if (auto && bp.getBoolean("removed", false)) { call.resolve(); return; }   // you dragged it away: stay removed until "show bubble"
+                      if (!auto) bp.edit().putBoolean("removed", false).apply();
                       Intent i = new Intent(getContext(), BubbleService.class);
+                      String base = call.getString("url");
+                      if (base != null && base.startsWith("http")) i.putExtra("base", base);
+                      i.putExtra("fromApp", true);
                       if (Build.VERSION.SDK_INT >= 26) getContext().startForegroundService(i); else getContext().startService(i);
                       call.resolve();
                   } catch (Exception e) { call.reject("Could not start the bubble"); }
@@ -229,7 +236,10 @@ jobs:
           cat > native/BubbleService.java <<'EOF'
           package com.echo1.app;
 
+          import android.annotation.SuppressLint;
+          import android.app.Activity;
           import android.app.AlertDialog;
+          import android.app.Application;
           import android.app.Notification;
           import android.app.NotificationChannel;
           import android.app.NotificationManager;
@@ -240,35 +250,108 @@ jobs:
           import android.content.pm.ServiceInfo;
           import android.graphics.Color;
           import android.graphics.PixelFormat;
-          import android.graphics.PorterDuff;
           import android.graphics.drawable.GradientDrawable;
           import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Handler;
           import android.os.IBinder;
+          import android.os.Looper;
+          import android.util.DisplayMetrics;
           import android.view.Gravity;
+          import android.view.HapticFeedbackConstants;
           import android.view.MotionEvent;
           import android.view.View;
+          import android.view.ViewGroup;
           import android.view.WindowManager;
+          import android.webkit.WebResourceError;
+          import android.webkit.WebResourceRequest;
+          import android.webkit.WebResourceResponse;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          import android.widget.FrameLayout;
           import android.widget.ImageView;
+          import android.widget.TextView;
           import android.widget.Toast;
+          import org.json.JSONObject;
 
-          /** ECHO-1 floating companion. Drag to move, tap to chat, long-press to customize. */
+          /**
+           * ECHO-1 floating companion: the same full-body chibi as inside the app.
+           * It runs the app's own companion code (bubble.html) in a small transparent web view, so it blinks, waves, nods,
+           * dozes off and reacts like the in-app chibi, and it uses the same saved look (boy or girl, colours, outfit).
+           * Drag to move. Drag it down onto the X to remove it. Tap to talk. Long-press for size.
+           */
           public class BubbleService extends Service {
-              private static final String PREFS = "echo_bubble_prefs";
-              private static final String PX = "x", PY = "y", PS = "size", PC = "accent";
+              static final String PREFS = "echo_bubble_prefs";
+              private static final String PX = "x", PY = "y", PH = "h", PBASE = "base", PREMOVED = "removed";
+              static BubbleService live;
+
               private WindowManager wm;
-              private ImageView bubble;
+              private FrameLayout box;
+              private WebView web;
+              private ImageView fallback;
               private WindowManager.LayoutParams lp;
+              private FrameLayout zone;
+              private GradientDrawable zoneBg;
+              private boolean zoneShown = false, overZone = false, failed = false, wasHidden = false;
               private SharedPreferences prefs;
-              private final int[] accents = new int[]{0xFFC8F43A, 0xFFB78CFF, 0xFFFF8FA3, 0xFF65D9FF, 0xFFFFB45E};
-              private final String[] accentNames = new String[]{"Lime", "Violet", "Rose", "Sky blue", "Amber"};
+              private final Handler ui = new Handler(Looper.getMainLooper());
+              private int appScreens = 0;
+              private Application.ActivityLifecycleCallbacks life;
+
+              // touch state
+              private float downX, downY;
+              private int startX, startY;
+              private boolean moved, longDone;
+              private final Runnable longPress = new Runnable() {
+                  @Override public void run() { if (!moved) { longDone = true; showCustomize(); } }
+              };
+
+              // ---- called by the assistant card, so the chibi reacts while you talk to it ----
+              static void js(final String code) {
+                  final BubbleService s = live;
+                  if (s == null) return;
+                  s.ui.post(new Runnable() {
+                      @Override public void run() { try { if (s.web != null && !s.failed) s.web.evaluateJavascript(code, null); } catch (Exception ignored) { } }
+                  });
+              }
+              static void state(String st) { js("window.EchoBubble&&EchoBubble.state('" + st + "')"); }
+              static void gesture(String g) { js("window.EchoBubble&&EchoBubble.gesture('" + g + "')"); }
+              static void react(String text, boolean fromUser) { js("window.EchoBubble&&EchoBubble.react(" + JSONObject.quote(text == null ? "" : text) + "," + fromUser + ")"); }
 
               @Override public IBinder onBind(Intent i) { return null; }
               private int dp(int v) { return Math.round(v * getResources().getDisplayMetrics().density); }
 
+              @Override public void onCreate() {
+                  super.onCreate();
+                  live = this;
+                  // The chibi inside the app is the same character, so the floating one hides while ECHO-1 itself is open.
+                  life = new Application.ActivityLifecycleCallbacks() {
+                      @Override public void onActivityStarted(Activity a) { if (a instanceof MainActivity) { appScreens++; syncVisible(); } }
+                      @Override public void onActivityStopped(Activity a) { if (a instanceof MainActivity) { appScreens = Math.max(0, appScreens - 1); syncVisible(); } }
+                      @Override public void onActivityCreated(Activity a, Bundle b) { }
+                      @Override public void onActivityResumed(Activity a) { }
+                      @Override public void onActivityPaused(Activity a) { }
+                      @Override public void onActivitySaveInstanceState(Activity a, Bundle b) { }
+                      @Override public void onActivityDestroyed(Activity a) { }
+                  };
+                  try { getApplication().registerActivityLifecycleCallbacks(life); } catch (Exception ignored) { }
+              }
+
               @Override public int onStartCommand(Intent intent, int flags, int startId) {
-                  if (intent != null && "STOP".equals(intent.getAction())) { stopSelf(); return START_NOT_STICKY; }
+                  prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+                  if (intent != null && "STOP".equals(intent.getAction())) {
+                      prefs.edit().putBoolean(PREMOVED, true).apply();
+                      stopSelf();
+                      return START_NOT_STICKY;
+                  }
+                  if (intent != null && intent.getStringExtra("base") != null) prefs.edit().putString(PBASE, intent.getStringExtra("base")).apply();
                   goForeground();
-                  if (bubble == null) addBubble();
+                  if (box == null) {
+                      // Started from inside the app: the app is in front, so stay hidden until it is closed (its own chibi is on screen).
+                      if (intent != null && intent.getBooleanExtra("fromApp", false)) appScreens = 1;
+                      addBubble();
+                  }
                   return START_STICKY;
               }
 
@@ -280,93 +363,219 @@ jobs:
                   PendingIntent hide = PendingIntent.getService(this, 1, new Intent(this, BubbleService.class).setAction("STOP"),
                       PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
                   Notification.Builder nb = Build.VERSION.SDK_INT >= 26 ? new Notification.Builder(this, ch) : new Notification.Builder(this);
-                  nb.setContentTitle("ECHO-1 companion is on").setContentText("Tap to chat · long-press the companion to customize")
+                  nb.setContentTitle("ECHO-1 companion is on").setContentText("Tap here to hide it · or drag it down to remove it")
                     .setSmallIcon(android.R.drawable.ic_btn_speak_now).setContentIntent(hide).setOngoing(true);
                   Notification n = nb.build();
                   if (Build.VERSION.SDK_INT >= 34) startForeground(7, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
                   else startForeground(7, n);
               }
 
+              private DisplayMetrics real() {
+                  DisplayMetrics m = new DisplayMetrics();
+                  wm.getDefaultDisplay().getRealMetrics(m);
+                  return m;
+              }
+
+              @SuppressLint("SetJavaScriptEnabled")
               private void addBubble() {
                   wm = (WindowManager) getSystemService(WINDOW_SERVICE);
-                  prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
-                  int size = dp(prefs.getInt(PS, 56));
-                  bubble = new ImageView(this);
-                  bubble.setImageResource(R.drawable.echo_widget_icon);
-                  bubble.setScaleType(ImageView.ScaleType.FIT_CENTER);
-                  bubble.setPadding(dp(3), dp(3), dp(3), dp(3));
-                  styleBubble();
-                  lp = new WindowManager.LayoutParams(size, size,
+                  int h = dp(prefs.getInt(PH, 120));
+                  int w = Math.round(h * 22f / 32f);
+
+                  box = new FrameLayout(this) {
+                      @Override public boolean onInterceptTouchEvent(MotionEvent e) { return true; }
+                      @Override public boolean onTouchEvent(MotionEvent e) { return handleTouch(e); }
+                  };
+
+                  // Simple icon, only shown if the chibi page can't load (for example, no internet).
+                  fallback = new ImageView(this);
+                  fallback.setImageResource(R.drawable.echo_widget_icon);
+                  fallback.setScaleType(ImageView.ScaleType.FIT_CENTER);
+                  fallback.setPadding(dp(6), dp(6), dp(6), dp(6));
+                  GradientDrawable fb = new GradientDrawable();
+                  fb.setShape(GradientDrawable.OVAL);
+                  fb.setColor(0xFF14101F);
+                  fb.setStroke(dp(2), 0xFFC8F43A);
+                  fallback.setBackground(fb);
+                  fallback.setVisibility(View.GONE);
+                  box.addView(fallback, new FrameLayout.LayoutParams(Math.min(w, h), Math.min(w, h), Gravity.CENTER));
+
+                  web = new WebView(getApplicationContext());
+                  web.setBackgroundColor(Color.TRANSPARENT);
+                  web.setVerticalScrollBarEnabled(false);
+                  web.setHorizontalScrollBarEnabled(false);
+                  WebSettings ws = web.getSettings();
+                  ws.setJavaScriptEnabled(true);
+                  ws.setDomStorageEnabled(true);          // same site storage as the app, so it uses your saved look
+                  web.setWebViewClient(new WebViewClient() {
+                      @Override public void onReceivedError(WebView v, WebResourceRequest r, WebResourceError err) { if (r.isForMainFrame()) showFallback(); }
+                      @Override public void onReceivedHttpError(WebView v, WebResourceRequest r, WebResourceResponse res) { if (r.isForMainFrame() && res.getStatusCode() >= 400) showFallback(); }
+                      @Override public void onPageFinished(WebView v, String u) { if (!failed) gesture("wave"); }
+                  });
+                  box.addView(web, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+                  lp = new WindowManager.LayoutParams(w, h,
                       Build.VERSION.SDK_INT >= 26 ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY : WindowManager.LayoutParams.TYPE_PHONE,
-                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS | WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
                       PixelFormat.TRANSLUCENT);
                   lp.gravity = Gravity.TOP | Gravity.START;
                   lp.x = prefs.getInt(PX, dp(12));
                   lp.y = prefs.getInt(PY, dp(240));
-                  bubble.setOnTouchListener(new View.OnTouchListener() {
-                      float downX, downY; int startX, startY; boolean moved; long downAt;
-                      @Override public boolean onTouch(View view, MotionEvent e) {
-                          switch (e.getAction()) {
-                              case MotionEvent.ACTION_DOWN:
-                                  downX=e.getRawX(); downY=e.getRawY(); startX=lp.x; startY=lp.y; moved=false; downAt=System.currentTimeMillis(); return true;
-                              case MotionEvent.ACTION_MOVE:
-                                  if (Math.abs(e.getRawX()-downX)>dp(8) || Math.abs(e.getRawY()-downY)>dp(8)) moved=true;
-                                  if (moved) { lp.x=startX+Math.round(e.getRawX()-downX); lp.y=startY+Math.round(e.getRawY()-downY); try { wm.updateViewLayout(bubble,lp); } catch(Exception ignored){} }
-                                  return true;
-                              case MotionEvent.ACTION_UP:
-                                  if (moved) prefs.edit().putInt(PX,lp.x).putInt(PY,lp.y).apply();
-                                  else if (System.currentTimeMillis()-downAt>=550) showCustomize();
-                                  else openAssistant();
-                                  return true;
-                          }
-                          return false;
-                      }
-                  });
-                  try { wm.addView(bubble,lp); } catch(Exception e) { bubble=null; stopSelf(); }
+                  try { wm.addView(box, lp); } catch (Exception e) { box = null; stopSelf(); return; }
+
+                  String base = prefs.getString(PBASE, "");
+                  if (base == null || base.length() < 8) showFallback();
+                  else web.loadUrl(base.replaceAll("/+$", "") + "/bubble.html?from=android");
+                  syncVisible();
               }
 
-              private void styleBubble() {
-                  if (bubble == null || prefs == null) return;
-                  int accent = accents[Math.max(0, Math.min(accents.length-1, prefs.getInt(PC,0)))];
-                  GradientDrawable bg = new GradientDrawable(); bg.setShape(GradientDrawable.OVAL);
-                  bg.setColor(0xFF14101F); bg.setStroke(dp(2),accent); bubble.setBackground(bg);
-                  bubble.clearColorFilter();   // keep the chibi companion in full colour; the accent only tints the ring
+              private void showFallback() {
+                  failed = true;
+                  ui.post(new Runnable() {
+                      @Override public void run() {
+                          if (web != null) web.setVisibility(View.GONE);
+                          if (fallback != null) fallback.setVisibility(View.VISIBLE);
+                      }
+                  });
+              }
+
+              private void syncVisible() {
+                  if (box == null) return;
+                  boolean hide = appScreens > 0;
+                  if (hide) { wasHidden = true; box.setVisibility(View.GONE); try { if (web != null) web.onPause(); } catch (Exception ignored) { } return; }
+                  box.setVisibility(View.VISIBLE);
+                  try { if (web != null) web.onResume(); } catch (Exception ignored) { }
+                  if (wasHidden) {            // you may have changed her look in the app, so load it again
+                      wasHidden = false;
+                      if (web != null && !failed) { try { web.reload(); } catch (Exception ignored) { } }
+                  }
+              }
+
+              // ---- touch: drag to move, drag down onto the X to remove, tap to talk, long-press for size ----
+              private boolean handleTouch(MotionEvent e) {
+                  switch (e.getActionMasked()) {
+                      case MotionEvent.ACTION_DOWN:
+                          downX = e.getRawX(); downY = e.getRawY(); startX = lp.x; startY = lp.y; moved = false; longDone = false;
+                          ui.postDelayed(longPress, 550);
+                          return true;
+                      case MotionEvent.ACTION_MOVE: {
+                          if (!moved && (Math.abs(e.getRawX() - downX) > dp(8) || Math.abs(e.getRawY() - downY) > dp(8))) {
+                              moved = true;
+                              ui.removeCallbacks(longPress);
+                              showZone();
+                              js("window.EchoBubble&&EchoBubble.drag(true)");
+                          }
+                          if (moved) {
+                              DisplayMetrics m = real();
+                              lp.x = Math.max(0, Math.min(m.widthPixels - lp.width, startX + Math.round(e.getRawX() - downX)));
+                              lp.y = Math.max(0, Math.min(m.heightPixels - lp.height, startY + Math.round(e.getRawY() - downY)));
+                              try { wm.updateViewLayout(box, lp); } catch (Exception ignored) { }
+                              checkZone(m);
+                          }
+                          return true;
+                      }
+                      case MotionEvent.ACTION_UP:
+                      case MotionEvent.ACTION_CANCEL: {
+                          ui.removeCallbacks(longPress);
+                          boolean up = e.getActionMasked() == MotionEvent.ACTION_UP;
+                          if (moved) {
+                              boolean drop = overZone;
+                              hideZone();
+                              js("window.EchoBubble&&EchoBubble.drag(false)");
+                              if (drop && up) { removeForGood(); return true; }
+                              prefs.edit().putInt(PX, lp.x).putInt(PY, lp.y).apply();
+                          } else if (up && !longDone) {
+                              gesture("wave");
+                              openAssistant();
+                          }
+                          return true;
+                      }
+                  }
+                  return true;
+              }
+
+              private void showZone() {
+                  if (zoneShown) return;
+                  zone = new FrameLayout(this);
+                  zoneBg = new GradientDrawable();
+                  zoneBg.setShape(GradientDrawable.OVAL);
+                  zoneBg.setColor(0xCC14101F);
+                  zoneBg.setStroke(dp(2), 0x66FFFFFF);
+                  zone.setBackground(zoneBg);
+                  TextView x = new TextView(this);
+                  x.setText("✕");
+                  x.setTextColor(0xFFF4F1FF);
+                  x.setTextSize(22);
+                  x.setGravity(Gravity.CENTER);
+                  zone.addView(x, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+                  WindowManager.LayoutParams zl = new WindowManager.LayoutParams(dp(68), dp(68),
+                      Build.VERSION.SDK_INT >= 26 ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY : WindowManager.LayoutParams.TYPE_PHONE,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                      PixelFormat.TRANSLUCENT);
+                  zl.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
+                  zl.y = dp(56);
+                  try { wm.addView(zone, zl); zoneShown = true; } catch (Exception ignored) { zone = null; }
+                  overZone = false;
+              }
+
+              private void checkZone(DisplayMetrics m) {
+                  if (!zoneShown || zone == null) return;
+                  float cx = lp.x + lp.width / 2f, cy = lp.y + lp.height / 2f;
+                  float zx = m.widthPixels / 2f, zy = m.heightPixels - dp(56) - dp(34);
+                  boolean over = Math.hypot(cx - zx, cy - zy) < dp(95);
+                  if (over != overZone) {
+                      overZone = over;
+                      zoneBg.setColor(over ? 0xFFE5484D : 0xCC14101F);
+                      zone.setScaleX(over ? 1.3f : 1f);
+                      zone.setScaleY(over ? 1.3f : 1f);
+                      if (over) { try { box.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS); } catch (Exception ignored) { } }
+                  }
+              }
+
+              private void hideZone() {
+                  if (zone != null) { try { wm.removeView(zone); } catch (Exception ignored) { } }
+                  zone = null; zoneShown = false; overZone = false;
+              }
+
+              private void removeForGood() {
+                  prefs.edit().putBoolean(PREMOVED, true).apply();   // stays removed until you say "show bubble" again
+                  stopSelf();
               }
 
               private void openAssistant() {
                   try { startActivity(new Intent(BubbleService.this, AssistActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP)); }
-                  catch(Exception ignored) { Toast.makeText(this,"Could not open ECHO-1",Toast.LENGTH_SHORT).show(); }
+                  catch (Exception ignored) { Toast.makeText(this, "Could not open ECHO-1", Toast.LENGTH_SHORT).show(); }
               }
 
               private void showCustomize() {
-                  if (isFinishingSafe()) return;
-                  final String[] choices = new String[]{"Small (44 dp)","Medium (56 dp)","Large (68 dp)","Extra large (80 dp)","Change accent colour"};
-                  AlertDialog dialog = new AlertDialog.Builder(this).setTitle("Customize your ECHO-1 companion")
-                    .setItems(choices,(d,which)->{
-                      if (which < 4) {
-                        int[] sizes={44,56,68,80}; int px=dp(sizes[which]);
-                        prefs.edit().putInt(PS,sizes[which]).apply(); lp.width=px; lp.height=px;
-                        try { wm.updateViewLayout(bubble,lp); } catch(Exception ignored){}
-                      } else showAccentPicker();
-                    }).setNegativeButton("Cancel",null).create();
-                  if (dialog.getWindow()!=null && Build.VERSION.SDK_INT>=26) dialog.getWindow().setType(WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY);
-                  dialog.show();
-              }
-
-              private boolean isFinishingSafe() { return bubble == null || !bubble.isAttachedToWindow(); }
-              private void showAccentPicker() {
-                  AlertDialog dialog = new AlertDialog.Builder(this).setTitle("Companion accent colour")
-                    .setSingleChoiceItems(accentNames,prefs.getInt(PC,0),(d,which)->{
-                      prefs.edit().putInt(PC,which).apply(); styleBubble(); d.dismiss();
-                    }).setNegativeButton("Cancel",null).create();
-                  if (dialog.getWindow()!=null && Build.VERSION.SDK_INT>=26) dialog.getWindow().setType(WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY);
+                  if (box == null || !box.isAttachedToWindow()) return;
+                  final String[] choices = new String[] { "Small", "Medium", "Large", "Extra large", "Remove from screen" };
+                  AlertDialog dialog = new AlertDialog.Builder(this).setTitle("ECHO-1 companion")
+                      .setItems(choices, new android.content.DialogInterface.OnClickListener() {
+                          @Override public void onClick(android.content.DialogInterface d, int which) {
+                              if (which < 4) {
+                                  int[] hs = new int[] { 90, 120, 150, 180 };
+                                  int h = dp(hs[which]);
+                                  prefs.edit().putInt(PH, hs[which]).apply();
+                                  lp.height = h;
+                                  lp.width = Math.round(h * 22f / 32f);
+                                  try { wm.updateViewLayout(box, lp); } catch (Exception ignored) { }
+                              } else removeForGood();
+                          }
+                      }).setNegativeButton("Cancel", null).create();
+                  if (dialog.getWindow() != null && Build.VERSION.SDK_INT >= 26) dialog.getWindow().setType(WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY);
                   dialog.show();
               }
 
               @Override public void onDestroy() {
                   super.onDestroy();
-                  try { if (wm != null && bubble != null) wm.removeView(bubble); } catch(Exception ignored){}
-                  bubble=null;
+                  if (live == this) live = null;
+                  ui.removeCallbacksAndMessages(null);
+                  hideZone();
+                  try { if (life != null) getApplication().unregisterActivityLifecycleCallbacks(life); } catch (Exception ignored) { }
+                  try { if (wm != null && box != null) wm.removeView(box); } catch (Exception ignored) { }
+                  try { if (web != null) { web.stopLoading(); web.destroy(); } } catch (Exception ignored) { }
+                  box = null; web = null;
               }
           }
           EOF
@@ -588,6 +797,7 @@ jobs:
 
               private void setListeningUi(boolean on) {
                   listening = on;
+                  BubbleService.state(on ? "listening" : "idle");
                   orb.setKind(on ? IconView.STOP : IconView.MIC);
                   orb.setBackground(on ? oval(ACCENT2, ACCENT, 2) : oval(ACCENT2, LINE, 1));
                   if (on) {
@@ -684,6 +894,8 @@ jobs:
                   Intent i = new Intent(this, MainActivity.class)
                       .putExtra("echo_query", q)
                       .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+                  BubbleService.react(q, true);
+                  BubbleService.state("thinking");
                   startActivity(i);
                   finish();
               }
@@ -748,6 +960,7 @@ jobs:
                   h.removeCallbacksAndMessages(null);
                   if (pulse != null) pulse.cancel();
                   destroyRecognizer();
+                  BubbleService.state("idle");
               }
           }
           EOF
